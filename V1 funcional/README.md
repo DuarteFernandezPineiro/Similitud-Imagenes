@@ -20,6 +20,21 @@ python -m pip install -r requirements.txt
 
 ## Uso
 
+### Interfaz gráfica
+
+Tras instalar las dependencias, inicia la aplicación con:
+
+```powershell
+python interfaz.py
+```
+
+Permite seleccionar la carpeta y el umbral, ver los grupos en una galería
+desplazable, mantener pulsada una imagen para ampliarla y seleccionar fotos de
+cualquier grupo para eliminarlas permanentemente. El borrado siempre requiere
+una confirmación explícita.
+
+### Línea de comandos
+
 ```powershell
 python agrupar_imagenes.py "C:\\Fotos" --similitud 90 --salida "C:\\Fotos\\grupos_similares.json"
 ```

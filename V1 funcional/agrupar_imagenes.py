@@ -507,6 +507,39 @@ def group_similar_images(hashes: list[int], threshold: int) -> list[list[int]]:
     return [members for members in grouped.values() if len(members) > 1]
 
 
+@dataclass(frozen=True)
+class AnalysisResult:
+    root: Path
+    threshold: int
+    image_count: int
+    groups: list[list[str]]
+    sync: CacheSync
+
+
+def analyze_folder(root: Path, threshold: int, workers: int) -> AnalysisResult:
+    """Ejecuta el análisis para la línea de comandos o la interfaz gráfica."""
+    root = root.expanduser().resolve()
+    if not root.is_dir():
+        raise ValueError(f"La carpeta no existe o no es una carpeta: {root}")
+    if threshold not in ALLOWED_THRESHOLDS:
+        raise ValueError("La similitud debe ser 80, 90, 95 o 100")
+    if workers < 1:
+        raise ValueError("El número de procesos debe ser al menos 1")
+
+    cache_path = root / ".similitud_imagenes.sqlite"
+    try:
+        cache = HashCache(cache_path)
+        try:
+            sync = load_images_from_cache(root, cache, workers, threshold)
+            groups = cache.grouped_paths()
+            image_count = cache.image_count()
+        finally:
+            cache.close()
+    except (OSError, sqlite3.Error) as error:
+        raise RuntimeError(f"No se pudo usar la caché {cache_path}: {error}") from error
+    return AnalysisResult(root, threshold, image_count, groups, sync)
+
+
 def parse_arguments() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Agrupa imágenes de una carpeta y sus subcarpetas por similitud perceptual."
@@ -530,10 +563,14 @@ def main() -> int:
         raise SystemExit(f"La carpeta no existe o no es una carpeta: {root}")
     if args.procesos < 1:
         raise SystemExit("--procesos debe ser al menos 1")
-
     print(f"Buscando imágenes en: {root}")
     print(f"Similitud mínima: {args.similitud}%")
-    cache_path = (args.cache.expanduser().resolve() if args.cache else root / ".similitud_imagenes.sqlite")
+    if args.cache:
+        # La opción se conserva para la línea de comandos; la interfaz usa la
+        # caché junto a la carpeta analizada para que sea autosuficiente.
+        cache_path = args.cache.expanduser().resolve()
+    else:
+        cache_path = root / ".similitud_imagenes.sqlite"
     try:
         cache = HashCache(cache_path)
         try:
