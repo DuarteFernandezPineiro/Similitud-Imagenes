@@ -50,7 +50,7 @@ class SimilarityApp(tk.Tk):
         self.summary = tk.StringVar(value="Aún no hay resultados.")
         self.groups: list[list[str]] = []
         self.selections: dict[int, set[str]] = {}
-        self.tiles: dict[tuple[int, str], tk.Label] = {}
+        self.tiles: dict[tuple[int, str], tuple[tk.Frame, tk.Label]] = {}
         self.group_frames: dict[int, tk.Frame] = {}
         self.group_titles: dict[int, tk.StringVar] = {}
         self.photos: dict[tuple[int, str], ImageTk.PhotoImage] = {}
@@ -238,18 +238,23 @@ class SimilarityApp(tk.Tk):
             background="white", foreground="#6b7785", font=("Segoe UI", 9),
         ).pack(side="right", padx=16)
 
-        grid = tk.Frame(card, background="white", padx=12, pady=(0, 14))
+        grid = tk.Frame(card, background="white", padx=12, pady=14)
         grid.pack(fill="x")
         for index, path in enumerate(paths):
             row, column = divmod(index, 6)
-            tile = tk.Label(
-                grid, text="Cargando…", compound="top", justify="center", wraplength=156,
-                background="#edf1f5", foreground="#52606d", width=22, height=9,
-                highlightbackground="#edf1f5", highlightthickness=3, cursor="hand2",
+            tile_box = tk.Frame(
+                grid, background="#edf1f5", width=166, height=142,
+                highlightbackground="#edf1f5", highlightthickness=3,
             )
-            tile.grid(row=row, column=column, padx=5, pady=5, sticky="n")
-            self.tiles[(group_id, path)] = tile
-            self._bind_tile(tile, group_id, path)
+            tile_box.grid(row=row, column=column, padx=5, pady=5, sticky="n")
+            tile_box.grid_propagate(False)
+            tile = tk.Label(
+                tile_box, text="Cargando…", justify="center", wraplength=150,
+                background="#edf1f5", foreground="#52606d", cursor="hand2",
+            )
+            tile.pack(fill="both", expand=True)
+            self.tiles[(group_id, path)] = (tile_box, tile)
+            self._bind_tile(tile_box, tile, group_id, path)
             self.pending_thumbnails.append((thumbnail_run, group_id, path))
 
     def _start_thumbnail_jobs(self, thumbnail_run: int) -> None:
@@ -275,21 +280,23 @@ class SimilarityApp(tk.Tk):
     def _show_thumbnail(self, thumbnail_run: int, group_id: int, path: str, image: Image.Image | None) -> None:
         self.active_thumbnails = max(0, self.active_thumbnails - 1)
         if thumbnail_run == self.run_id:
-            tile = self.tiles.get((group_id, path))
-            if tile and tile.winfo_exists():
+            tile_widgets = self.tiles.get((group_id, path))
+            if tile_widgets and tile_widgets[1].winfo_exists():
+                _, tile = tile_widgets
                 if image is None:
                     tile.configure(text="No se puede\nmostrar", image="")
                 else:
                     photo = ImageTk.PhotoImage(image)
                     self.photos[(group_id, path)] = photo
-                    tile.configure(image=photo, text=Path(path).name, height=0)
+                    tile.configure(image=photo, text="")
                 self._paint_selection(group_id, path)
         self._start_thumbnail_jobs(self.run_id)
 
-    def _bind_tile(self, tile: tk.Label, group_id: int, path: str) -> None:
-        tile.bind("<ButtonPress-1>", lambda event: self._press_tile(group_id, path))
-        tile.bind("<ButtonRelease-1>", lambda event: self._release_tile(group_id, path))
-        tile.bind("<Leave>", lambda event: self._cancel_hold())
+    def _bind_tile(self, tile_box: tk.Frame, tile: tk.Label, group_id: int, path: str) -> None:
+        for widget in (tile_box, tile):
+            widget.bind("<ButtonPress-1>", lambda event: self._press_tile(group_id, path))
+            widget.bind("<ButtonRelease-1>", lambda event: self._release_tile(group_id, path))
+            widget.bind("<Leave>", lambda event: self._cancel_hold())
 
     def _press_tile(self, group_id: int, path: str) -> None:
         self._cancel_hold()
@@ -321,11 +328,12 @@ class SimilarityApp(tk.Tk):
         self._show_preview(path)
 
     def _paint_selection(self, group_id: int, path: str) -> None:
-        tile = self.tiles.get((group_id, path))
-        if not tile or not tile.winfo_exists():
+        tile_widgets = self.tiles.get((group_id, path))
+        if not tile_widgets or not tile_widgets[0].winfo_exists():
             return
+        tile_box, _ = tile_widgets
         selected = path in self.selections.get(group_id, set())
-        tile.configure(highlightbackground="#1677d2" if selected else "#edf1f5", highlightthickness=3)
+        tile_box.configure(highlightbackground="#1677d2" if selected else "#edf1f5", highlightthickness=3)
 
     def _select_all(self, group_id: int) -> None:
         paths = self.groups[group_id]
@@ -360,10 +368,10 @@ class SimilarityApp(tk.Tk):
         if deleted:
             self.groups[group_id] = [path for path in self.groups[group_id] if path not in deleted]
             for path in deleted:
-                tile = self.tiles.pop((group_id, path), None)
+                tile_widgets = self.tiles.pop((group_id, path), None)
                 self.photos.pop((group_id, path), None)
-                if tile and tile.winfo_exists():
-                    tile.destroy()
+                if tile_widgets and tile_widgets[0].winfo_exists():
+                    tile_widgets[0].destroy()
             self.selections[group_id].difference_update(deleted)
             if self.groups[group_id]:
                 self._update_group_title(group_id)
