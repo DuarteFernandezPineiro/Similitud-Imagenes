@@ -1,0 +1,14 @@
+# Resultados y cachés locales: pueden incluir rutas personales y se regeneran.
+**/grupos_similares.json
+**/.similitud_imagenes.sqlite
+**/.similitud_imagenes.sqlite-*
+
+# Archivos generados por Python.
+**/__pycache__/
+*.py[cod]
+
+# Entornos y configuración local.
+.venv/
+venv/
+.idea/
+.vscode/
