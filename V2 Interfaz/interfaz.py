@@ -6,6 +6,7 @@ from __future__ import annotations
 import os
 import queue
 import threading
+import time
 import tkinter as tk
 from collections import deque
 from concurrent.futures import Future, ThreadPoolExecutor
@@ -15,7 +16,7 @@ from typing import Any
 
 from PIL import Image, ImageOps, ImageTk, UnidentifiedImageError
 
-from agrupar_imagenes import ALLOWED_THRESHOLDS, AnalysisResult, analyze_folder
+from agrupar_imagenes import ALLOWED_THRESHOLDS, AnalysisProgress, AnalysisResult, analyze_folder
 
 
 HOLD_TO_ENLARGE_MS = 500
@@ -62,8 +63,13 @@ class SimilarityApp(tk.Tk):
         self.thumbnail_pool = ThreadPoolExecutor(max_workers=4, thread_name_prefix="miniaturas")
         self.pending_thumbnails: deque[tuple[int, int, str, tuple[int, int]]] = deque()
         self.active_thumbnails = 0
-        self.run_id = 0
+        self.analysis_run_id = 0
+        self.gallery_run_id = 0
         self.analysis_running = False
+        self.live_signature: tuple[tuple[str, ...], ...] = ()
+        self.pending_live_groups: list[list[str]] | None = None
+        self.last_live_render = 0.0
+        self.live_update_timer: str | None = None
         self.press_timer: str | None = None
         self.long_press_opened = False
 
@@ -88,7 +94,7 @@ class SimilarityApp(tk.Tk):
         ttk.Label(controls, text="Imágenes similares", style="Title.TLabel").grid(row=0, column=0, sticky="w")
         ttk.Label(
             controls,
-            text="Elige una carpeta, calcula los grupos y selecciona las fotos que quieras eliminar.",
+            text="Elige una carpeta para empezar y selecciona las fotos que quieras eliminar.",
             style="Body.TLabel",
         ).grid(row=1, column=0, columnspan=6, sticky="w", pady=(3, 14))
 
@@ -174,6 +180,7 @@ class SimilarityApp(tk.Tk):
         folder = filedialog.askdirectory(title="Selecciona la carpeta de fotos", mustexist=True)
         if folder:
             self.folder.set(folder)
+            self._start_analysis()
 
     def _start_analysis(self) -> None:
         if self.analysis_running:
@@ -185,14 +192,34 @@ class SimilarityApp(tk.Tk):
         self.analysis_running = True
         self.analyze_button.configure(state="disabled")
         self.status.set("Analizando imágenes y actualizando grupos…")
+        self.summary.set("Preparando el análisis…")
+        self.progress.configure(mode="indeterminate", value=0)
         self.progress.start(12)
-        self.run_id += 1
-        current_run = self.run_id
+        self.analysis_run_id += 1
+        current_run = self.analysis_run_id
+        self.groups = []
+        self.image_count = 0
+        self.current_group = 0
+        self.view_mode = "overview"
+        self.overview_scroll_position = 0.0
+        self.selections.clear()
+        self.live_signature = ()
+        self.pending_live_groups = None
+        self.last_live_render = 0.0
+        if self.live_update_timer is not None:
+            self.after_cancel(self.live_update_timer)
+            self.live_update_timer = None
+        self._render_current_group()
         workers = max(1, min(os.cpu_count() or 1, 4))
 
         def work() -> None:
             try:
-                result = analyze_folder(folder, self.threshold.get(), workers)
+                result = analyze_folder(
+                    folder,
+                    self.threshold.get(),
+                    workers,
+                    lambda progress: self.events.put(("progress", current_run, progress)),
+                )
                 self.events.put(("analysis", current_run, result, None))
             except Exception as error:  # Se muestra al usuario sin cerrar la aplicación.
                 self.events.put(("analysis", current_run, None, error))
@@ -200,32 +227,46 @@ class SimilarityApp(tk.Tk):
         threading.Thread(target=work, daemon=True, name="analisis-imagenes").start()
 
     def _consume_events(self) -> None:
+        latest_progress: tuple[int, AnalysisProgress] | None = None
         try:
             while True:
                 event = self.events.get_nowait()
                 if event[0] == "analysis":
                     self._finish_analysis(*event[1:])
+                elif event[0] == "progress":
+                    latest_progress = (event[1], event[2])
                 elif event[0] == "thumbnail":
                     self._show_thumbnail(*event[1:])
         except queue.Empty:
             pass
+        if latest_progress is not None:
+            self._show_analysis_progress(*latest_progress)
         self.after(40, self._consume_events)
 
     def _finish_analysis(self, event_run: int, result: AnalysisResult | None, error: Exception | None) -> None:
-        if event_run != self.run_id:
+        if event_run != self.analysis_run_id:
             return
         self.analysis_running = False
         self.analyze_button.configure(state="normal")
         self.progress.stop()
+        self.progress.configure(mode="determinate", maximum=100, value=100)
+        if self.live_update_timer is not None:
+            self.after_cancel(self.live_update_timer)
+            self.live_update_timer = None
         if error:
             self.status.set("No se pudo completar el análisis.")
             messagebox.showerror("Error al analizar", str(error), parent=self)
             return
         assert result is not None
+        had_live_groups = bool(self.groups)
+        was_reviewing_group = self.view_mode == "group" and had_live_groups
+        previous_paths = list(self.groups[self.current_group]) if was_reviewing_group else []
+        previous_selection = set(self.selections.get(self.current_group, set())) if was_reviewing_group else set()
+        if self.view_mode == "overview":
+            self.overview_scroll_position = self.canvas.yview()[0]
         self.groups = [list(group) for group in result.groups]
-        self.current_group = 0
-        self.view_mode = "group"
-        self.overview_scroll_position = 0.0
+        self.pending_live_groups = None
+        self.live_signature = tuple(tuple(group) for group in self.groups)
         self.image_count = result.image_count
         self.selections.clear()
         self.summary.set(f"{result.image_count:,} imágenes · {len(self.groups):,} grupos")
@@ -233,7 +274,105 @@ class SimilarityApp(tk.Tk):
         self.status.set(
             f"Listo: {result.sync.calculated:,} hashes calculados, {result.sync.reused:,} reutilizados · {mode}."
         )
-        self._render_groups()
+        if was_reviewing_group:
+            self.current_group = self._matching_group_index(previous_paths, self.groups)
+            self.view_mode = "group"
+            if self.groups:
+                retained_selection = previous_selection.intersection(self.groups[self.current_group])
+                if retained_selection:
+                    self.selections[self.current_group] = retained_selection
+            self._render_current_group()
+        elif self.view_mode == "overview" and had_live_groups:
+            self._render_overview()
+        else:
+            self._render_groups()
+
+    def _show_analysis_progress(self, event_run: int, progress: AnalysisProgress) -> None:
+        if event_run != self.analysis_run_id or not self.analysis_running:
+            return
+        self.progress.stop()
+        self.progress.configure(
+            mode="determinate",
+            maximum=max(1, progress.total),
+            value=min(progress.processed, progress.total),
+        )
+        self.status.set(f"Procesando imágenes: {progress.processed:,} de {progress.total:,}…")
+        self.summary.set(
+            f"{progress.processed:,}/{progress.total:,} procesadas · "
+            f"{progress.groups_found:,} grupos disponibles"
+        )
+        live_groups = self._existing_groups(progress.groups)
+        signature = tuple(tuple(group) for group in live_groups)
+        if signature == self.live_signature:
+            return
+        self.live_signature = signature
+        if self.view_mode == "group" and self.groups:
+            # Mientras se revisa, no se redibuja la galería bajo los pies de
+            # la persona usuaria. El siguiente grupo aplica esta actualización.
+            self.pending_live_groups = live_groups
+            self._set_navigation_state()
+            return
+        self._queue_or_apply_live_groups(live_groups, keep_current=False)
+
+    def _queue_or_apply_live_groups(self, groups: list[list[str]], keep_current: bool) -> None:
+        if time.monotonic() - self.last_live_render >= 0.35:
+            self._replace_live_groups(groups, keep_current=keep_current)
+            return
+        self.pending_live_groups = groups
+        if self.live_update_timer is None:
+            self.live_update_timer = self.after(350, self._flush_live_groups)
+
+    def _flush_live_groups(self) -> None:
+        self.live_update_timer = None
+        if not self.analysis_running or self.pending_live_groups is None:
+            return
+        if self.view_mode == "group":
+            return
+        groups = self.pending_live_groups
+        self._replace_live_groups(groups, keep_current=self.view_mode == "group")
+
+    def _existing_groups(self, groups: list[list[str]]) -> list[list[str]]:
+        return [
+            existing
+            for group in groups
+            if len(existing := [path for path in group if Path(path).is_file()]) > 1
+        ]
+
+    def _replace_live_groups(self, groups: list[list[str]], keep_current: bool = False) -> None:
+        previous_paths: list[str] = []
+        selected_paths: set[str] = set()
+        if keep_current and self.groups:
+            previous_paths = self.groups[self.current_group]
+            selected_paths = set(self.selections.get(self.current_group, set()))
+        self.groups = groups
+        self.pending_live_groups = None
+        self.selections.clear()
+        self.last_live_render = time.monotonic()
+        if keep_current:
+            self.current_group = self._matching_group_index(previous_paths, self.groups)
+            self.view_mode = "group"
+            if self.groups:
+                retained_selection = selected_paths.intersection(self.groups[self.current_group])
+                if retained_selection:
+                    self.selections[self.current_group] = retained_selection
+            self._render_current_group()
+            return
+        self.current_group = 0
+        self.view_mode = "overview"
+        self._render_overview()
+
+    @staticmethod
+    def _matching_group_index(previous_paths: list[str], groups: list[list[str]]) -> int:
+        previous_set = set(previous_paths)
+        return max(
+            range(len(groups)),
+            key=lambda index: len(previous_set.intersection(groups[index])),
+            default=0,
+        )
+
+    def _apply_pending_live_groups(self) -> None:
+        if self.pending_live_groups is not None:
+            self._replace_live_groups(self.pending_live_groups, keep_current=self.view_mode == "group")
 
     def _render_groups(self) -> None:
         self.current_group = 0
@@ -241,8 +380,8 @@ class SimilarityApp(tk.Tk):
         self._render_current_group()
 
     def _render_current_group(self) -> None:
-        self.run_id += 1
-        thumbnail_run = self.run_id
+        self.gallery_run_id += 1
+        thumbnail_run = self.gallery_run_id
         self.pending_thumbnails.clear()
         self.active_thumbnails = 0
         self.photos.clear()
@@ -300,8 +439,8 @@ class SimilarityApp(tk.Tk):
             self.pending_thumbnails.append((thumbnail_run, group_id, path, image_bounds))
 
     def _render_overview(self) -> None:
-        self.run_id += 1
-        thumbnail_run = self.run_id
+        self.gallery_run_id += 1
+        thumbnail_run = self.gallery_run_id
         self.pending_thumbnails.clear()
         self.active_thumbnails = 0
         self.photos.clear()
@@ -344,7 +483,7 @@ class SimilarityApp(tk.Tk):
         self.after(120, lambda: self._restore_overview_scroll(thumbnail_run))
 
     def _restore_overview_scroll(self, thumbnail_run: int) -> None:
-        if self.view_mode != "overview" or thumbnail_run != self.run_id:
+        if self.view_mode != "overview" or thumbnail_run != self.gallery_run_id:
             return
         self.update_idletasks()
         self.canvas.configure(scrollregion=self.canvas.bbox("all"))
@@ -354,7 +493,10 @@ class SimilarityApp(tk.Tk):
         has_groups = bool(self.groups)
         reviewing_group = has_groups and self.view_mode == "group"
         self.previous_button.configure(state="normal" if reviewing_group and self.current_group > 0 else "disabled")
-        self.next_button.configure(state="normal" if reviewing_group and self.current_group < len(self.groups) - 1 else "disabled")
+        can_go_next = reviewing_group and (
+            self.current_group < len(self.groups) - 1 or self.pending_live_groups is not None
+        )
+        self.next_button.configure(state="normal" if can_go_next else "disabled")
         action_state = "normal" if reviewing_group else "disabled"
         self.select_all_button.configure(state=action_state)
         self.delete_button.configure(state=action_state)
@@ -362,6 +504,8 @@ class SimilarityApp(tk.Tk):
         self.groups_button.configure(text="Ver grupos" if self.view_mode == "group" else "Volver al grupo")
 
     def _go_to_group(self, direction: int) -> None:
+        if direction > 0 and self.pending_live_groups is not None:
+            self._replace_live_groups(self.pending_live_groups, keep_current=True)
         destination = self.current_group + direction
         if 0 <= destination < len(self.groups):
             self._clear_selections()
@@ -384,6 +528,9 @@ class SimilarityApp(tk.Tk):
         if not self.groups:
             return
         if self.view_mode == "group":
+            if self.pending_live_groups is not None:
+                self._replace_live_groups(self.pending_live_groups)
+                return
             self.view_mode = "overview"
             self._render_overview()
         else:
@@ -417,7 +564,7 @@ class SimilarityApp(tk.Tk):
 
     def _show_thumbnail(self, thumbnail_run: int, group_id: int, path: str, image: Image.Image | None) -> None:
         self.active_thumbnails = max(0, self.active_thumbnails - 1)
-        if thumbnail_run == self.run_id:
+        if thumbnail_run == self.gallery_run_id:
             tile_widgets = self.tiles.get((group_id, path))
             if tile_widgets and tile_widgets[1].winfo_exists():
                 _, tile = tile_widgets
@@ -428,7 +575,7 @@ class SimilarityApp(tk.Tk):
                     self.photos[(group_id, path)] = photo
                     tile.configure(image=photo, text="")
                 self._paint_selection(group_id, path)
-        self._start_thumbnail_jobs(self.run_id)
+        self._start_thumbnail_jobs(self.gallery_run_id)
 
     def _bind_review_tile(self, tile_box: tk.Frame, tile: tk.Label, group_id: int, path: str) -> None:
         for widget in (tile_box, tile):

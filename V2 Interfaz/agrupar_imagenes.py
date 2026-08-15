@@ -17,7 +17,7 @@ from concurrent.futures import ProcessPoolExecutor
 from dataclasses import dataclass
 from itertools import combinations, islice
 from pathlib import Path
-from typing import Iterable, Iterator
+from typing import Callable, Iterable, Iterator
 
 import numpy as np
 from PIL import Image, ImageOps, UnidentifiedImageError
@@ -314,29 +314,46 @@ def batches(items: Iterable[ImageFile], size: int) -> Iterator[list[ImageFile]]:
         yield batch
 
 
-def hash_images(files: list[ImageFile], workers: int) -> tuple[dict[str, int], list[dict[str, str]]]:
+def hash_images(
+    files: list[ImageFile],
+    workers: int,
+    progress_callback: Callable[[int, int, dict[str, int], dict[str, int]], None] | None = None,
+) -> tuple[dict[str, int], list[dict[str, str]]]:
     """Calcula en paralelo solo los hashes que no estaban en la caché."""
     hashes: dict[str, int] = {}
     unreadable: list[dict[str, str]] = []
     batch_size = max(64, workers * 32)
+    processed = 0
+    total = len(files)
 
-    def store(results: Iterable[tuple[str, int | None, str | None]]) -> None:
+    def store(results: Iterable[tuple[str, int | None, str | None]]) -> dict[str, int]:
+        batch_hashes: dict[str, int] = {}
         for path_as_text, image_hash, error in results:
             if image_hash is None:
                 unreadable.append({"ruta": path_as_text, "error": error or "Error desconocido"})
             else:
                 hashes[path_as_text] = image_hash
+                batch_hashes[path_as_text] = image_hash
+        return batch_hashes
+
+    def report_progress(batch_size: int, batch_hashes: dict[str, int]) -> None:
+        nonlocal processed
+        processed += batch_size
+        if progress_callback is not None:
+            progress_callback(processed, total, hashes, batch_hashes)
 
     # Con un proceso se evita el coste de crear procesos hijos y facilita usarlo
     # también en entornos restringidos. Con más, la decodificación va en paralelo.
     if workers == 1:
         for batch in batches(files, batch_size):
-            store(map(perceptual_hash, (file.path for file in batch)))
+            batch_hashes = store(map(perceptual_hash, (file.path for file in batch)))
+            report_progress(len(batch), batch_hashes)
             print(f"Hasheadas nuevas/modificadas: {len(hashes):,}", end="\r", flush=True)
     else:
         with ProcessPoolExecutor(max_workers=workers) as pool:
             for batch in batches(files, batch_size):
-                store(pool.map(perceptual_hash, (file.path for file in batch)))
+                batch_hashes = store(pool.map(perceptual_hash, (file.path for file in batch)))
+                report_progress(len(batch), batch_hashes)
                 print(f"Hasheadas nuevas/modificadas: {len(hashes):,}", end="\r", flush=True)
     print(" " * 40, end="\r")
     return hashes, unreadable
@@ -351,8 +368,22 @@ class CacheSync:
     new_images: int
 
 
+@dataclass(frozen=True)
+class AnalysisProgress:
+    """Grupos ya disponibles para trabajar mientras continúa el análisis."""
+
+    processed: int
+    total: int
+    groups: list[list[str]]
+    groups_found: int
+
+
 def load_images_from_cache(
-    root: Path, cache: HashCache, workers: int, threshold: int
+    root: Path,
+    cache: HashCache,
+    workers: int,
+    threshold: int,
+    progress_callback: Callable[[AnalysisProgress], None] | None = None,
 ) -> CacheSync:
     """Sincroniza la caché y actualiza solo los grupos conectados por altas nuevas."""
     files = list(image_files(root))
@@ -370,13 +401,47 @@ def load_images_from_cache(
         or entry.size != file.size
         or entry.modified_ns != file.modified_ns
     ]
-    calculated, unreadable = hash_images(files_to_hash, workers)
+    # En una primera ejecución se agrupa cada lote conforme se termina de
+    # hashear. Así la interfaz puede ofrecer grupos reales para revisar y
+    # borrar sin esperar a que termine toda la carpeta.
+    is_first_analysis = not cached
+    streaming_grouper = StreamingGrouper(threshold) if is_first_analysis else None
+
+    def report_hash_progress(
+        processed: int,
+        total: int,
+        hashes: dict[str, int],
+        batch_hashes: dict[str, int],
+    ) -> None:
+        if streaming_grouper is not None:
+            streaming_grouper.add_batch(batch_hashes)
+        if progress_callback is None:
+            return
+        if streaming_grouper is not None:
+            groups = streaming_grouper.visible_groups()
+            groups_found = streaming_grouper.group_count
+        else:
+            groups = []
+            groups_found = 0
+        progress_callback(AnalysisProgress(processed, total, groups, groups_found))
+
+    calculated, unreadable = hash_images(files_to_hash, workers, report_hash_progress)
     file_by_path = {file.path: file for file in files_to_hash}
+    # La persona usuaria puede borrar una foto mientras se muestran los
+    # grupos en directo. No guardamos en SQLite un hash de un archivo que ya
+    # no exista o que haya cambiado durante el análisis.
+    calculated = {
+        path: image_hash
+        for path, image_hash in calculated.items()
+        if (current := _current_file_metadata(path)) is not None
+        and current == (file_by_path[path].size, file_by_path[path].modified_ns)
+    }
     cache.save({path: (file_by_path[path], image_hash) for path, image_hash in calculated.items()})
 
     # Una imagen modificada que ya no se puede leer no debe conservar su hash antiguo.
     failed_paths = {item["ruta"] for item in unreadable}
-    removed_paths = set(cached) - current_paths
+    existing_paths = {path for path in current_paths if Path(path).is_file()}
+    removed_paths = set(cached) - existing_paths
     stale_paths = removed_paths | failed_paths
     cache.remove(stale_paths)
 
@@ -390,9 +455,18 @@ def load_images_from_cache(
     )
     if full_rebuild:
         records = cache.all_records()
-        hashes = [image_hash for _, _, image_hash in records]
-        print("Reconstruyendo grupos completos por cambios, borrados o nuevo umbral...")
-        cache.replace_groups([row_id for row_id, _, _ in records], group_similar_images(hashes, threshold))
+        row_ids = [row_id for row_id, _, _ in records]
+        if is_first_analysis and streaming_grouper is not None:
+            row_position_by_path = {path: position for position, (_, path, _) in enumerate(records)}
+            groups = [
+                [row_position_by_path[path] for path in members if path in row_position_by_path]
+                for members in streaming_grouper.all_groups()
+            ]
+            cache.replace_groups(row_ids, groups)
+        else:
+            hashes = [image_hash for _, _, image_hash in records]
+            print("Reconstruyendo grupos completos por cambios, borrados o nuevo umbral...")
+            cache.replace_groups(row_ids, group_similar_images(hashes, threshold))
     elif successful_new_paths:
         new_records = cache.records_for_paths(successful_new_paths)
         for position, (row_id, _, image_hash, current_group) in enumerate(new_records, start=1):
@@ -419,14 +493,21 @@ class UnionFind:
             item = self.parent[item]
         return item
 
-    def union(self, first: int, second: int) -> None:
+    def add(self) -> int:
+        item = len(self.parent)
+        self.parent.append(item)
+        self.size.append(1)
+        return item
+
+    def union(self, first: int, second: int) -> int:
         first_root, second_root = self.find(first), self.find(second)
         if first_root == second_root:
-            return
+            return first_root
         if self.size[first_root] < self.size[second_root]:
             first_root, second_root = second_root, first_root
         self.parent[second_root] = first_root
         self.size[first_root] += self.size[second_root]
+        return first_root
 
 
 @dataclass(frozen=True)
@@ -471,7 +552,82 @@ def max_hamming_distance(threshold: int) -> int:
     return int(HASH_BITS * (100 - threshold) // 100)
 
 
-def group_similar_images(hashes: list[int], threshold: int) -> list[list[int]]:
+def _current_file_metadata(path_as_text: str) -> tuple[int, int] | None:
+    try:
+        metadata = Path(path_as_text).stat()
+    except OSError:
+        return None
+    return metadata.st_size, metadata.st_mtime_ns
+
+
+class StreamingGrouper:
+    """Índice incremental exacto para publicar grupos durante el hasheado."""
+
+    def __init__(self, threshold: int) -> None:
+        self.max_distance = max_hamming_distance(threshold)
+        self.plan = plan_for(self.max_distance)
+        self.per_part_masks = [masks(width, self.plan.local_radius) for width in self.plan.widths]
+        self.index: list[dict[int, list[int]]] = [defaultdict(list) for _ in self.plan.widths]
+        self.hashes: list[int] = []
+        self.paths: list[str] = []
+        self.groups = UnionFind(0)
+        self.seen = array("I")
+        self.marker = 0
+        self.members: dict[int, list[str]] = {}
+        self.grouped_roots: dict[int, None] = {}
+
+    @property
+    def group_count(self) -> int:
+        return len(self.grouped_roots)
+
+    def add_batch(self, hashes: dict[str, int]) -> None:
+        for path, image_hash in hashes.items():
+            self.add(path, image_hash)
+
+    def add(self, path: str, image_hash: int) -> None:
+        image_id = self.groups.add()
+        self.hashes.append(image_hash)
+        self.paths.append(path)
+        self.seen.append(0)
+        self.members[image_id] = [path]
+        self.marker += 1
+
+        for part, value in enumerate(split_hash(image_hash, self.plan.widths)):
+            for mask in self.per_part_masks[part]:
+                for candidate_id in self.index[part].get(value ^ mask, ()):
+                    if self.seen[candidate_id] == self.marker:
+                        continue
+                    self.seen[candidate_id] = self.marker
+                    if (image_hash ^ self.hashes[candidate_id]).bit_count() <= self.max_distance:
+                        self._merge(image_id, candidate_id)
+
+        for part, value in enumerate(split_hash(image_hash, self.plan.widths)):
+            self.index[part][value].append(image_id)
+
+    def _merge(self, first: int, second: int) -> None:
+        first_root, second_root = self.groups.find(first), self.groups.find(second)
+        if first_root == second_root:
+            return
+        destination = self.groups.union(first_root, second_root)
+        source = second_root if destination == first_root else first_root
+        destination_members = self.members.pop(destination)
+        source_members = self.members.pop(source)
+        self.grouped_roots.pop(destination, None)
+        self.grouped_roots.pop(source, None)
+        self.members[destination] = destination_members + source_members
+        if len(self.members[destination]) > 1:
+            self.grouped_roots[destination] = None
+
+    def visible_groups(self) -> list[list[str]]:
+        return [list(self.members[root]) for root in self.grouped_roots]
+
+    def all_groups(self) -> list[list[str]]:
+        return [list(self.members[root]) for root in self.grouped_roots]
+
+
+def group_similar_images(
+    hashes: list[int], threshold: int, show_progress: bool = True
+) -> list[list[int]]:
     max_distance = max_hamming_distance(threshold)
     plan = plan_for(max_distance)
     per_part_masks = [masks(width, plan.local_radius) for width in plan.widths]
@@ -497,9 +653,10 @@ def group_similar_images(hashes: list[int], threshold: int) -> list[list[int]]:
                     comparisons += 1
                     if (image_hash ^ hashes[candidate_id]).bit_count() <= max_distance:
                         groups.union(image_id, candidate_id)
-        if image_id % 500 == 0 or image_id + 1 == len(hashes):
+        if show_progress and (image_id % 500 == 0 or image_id + 1 == len(hashes)):
             print(f"Comparando: {image_id + 1:,}/{len(hashes):,} | candidatas verificadas: {comparisons:,}", end="\r", flush=True)
-    print(" " * 100, end="\r")
+    if show_progress:
+        print(" " * 100, end="\r")
 
     grouped: dict[int, list[int]] = defaultdict(list)
     for image_id in range(len(hashes)):
@@ -516,7 +673,12 @@ class AnalysisResult:
     sync: CacheSync
 
 
-def analyze_folder(root: Path, threshold: int, workers: int) -> AnalysisResult:
+def analyze_folder(
+    root: Path,
+    threshold: int,
+    workers: int,
+    progress_callback: Callable[[AnalysisProgress], None] | None = None,
+) -> AnalysisResult:
     """Ejecuta el análisis para la línea de comandos o la interfaz gráfica."""
     root = root.expanduser().resolve()
     if not root.is_dir():
@@ -530,7 +692,7 @@ def analyze_folder(root: Path, threshold: int, workers: int) -> AnalysisResult:
     try:
         cache = HashCache(cache_path)
         try:
-            sync = load_images_from_cache(root, cache, workers, threshold)
+            sync = load_images_from_cache(root, cache, workers, threshold, progress_callback)
             groups = cache.grouped_paths()
             image_count = cache.image_count()
         finally:
