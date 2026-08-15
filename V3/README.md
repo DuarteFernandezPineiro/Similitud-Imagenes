@@ -62,8 +62,9 @@ tiene que permanecer encendido, desbloqueado y conectado durante la importación
 y durante un borrado.
 
 Al borrar varias imágenes, V3 solicita una única confirmación para la selección
-completa. Las confirmaciones repetidas de Explorer se suprimen solo durante esa
-operación y el ajuste previo de Windows se restaura al terminar.
+completa. Si el proveedor MTP muestra su propio aviso por cada archivo, V3 lo
+acepta automáticamente solo cuando el aviso contiene el nombre de una imagen
+que ya fue seleccionada; no interactúa con otros avisos de Windows.
 
 ### Línea de comandos
 

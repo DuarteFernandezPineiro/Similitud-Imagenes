@@ -23,6 +23,92 @@ IMAGE_EXTENSIONS = {
     ".png", ".tif", ".tiff", ".webp",
 }
 CACHE_MARKER = ".similitud_movil_cache"
+DIALOG_CLOSER_CSHARP = r"""
+using System;
+using System.Text;
+using System.Threading;
+using System.Runtime.InteropServices;
+
+public static class MobileDeleteDialogCloser
+{
+    private const uint BM_CLICK = 0x00F5;
+    private const int IDYES = 6;
+
+    private delegate bool EnumWindowsProc(IntPtr window, IntPtr parameter);
+
+    [DllImport("user32.dll")]
+    private static extern bool EnumWindows(EnumWindowsProc callback, IntPtr parameter);
+    [DllImport("user32.dll")]
+    private static extern bool EnumChildWindows(IntPtr parent, EnumWindowsProc callback, IntPtr parameter);
+    [DllImport("user32.dll")]
+    private static extern bool IsWindowVisible(IntPtr window);
+    [DllImport("user32.dll", CharSet = CharSet.Unicode)]
+    private static extern int GetWindowText(IntPtr window, StringBuilder text, int maxCount);
+    [DllImport("user32.dll", CharSet = CharSet.Unicode)]
+    private static extern int GetWindowTextLength(IntPtr window);
+    [DllImport("user32.dll")]
+    private static extern IntPtr GetDlgItem(IntPtr window, int itemId);
+    [DllImport("user32.dll")]
+    private static extern IntPtr SendMessage(IntPtr window, uint message, IntPtr wParam, IntPtr lParam);
+
+    private static string ReadText(IntPtr window)
+    {
+        int length = GetWindowTextLength(window);
+        if (length == 0) return String.Empty;
+        var text = new StringBuilder(length + 1);
+        GetWindowText(window, text, text.Capacity);
+        return text.ToString();
+    }
+
+    private static bool ContainsSelectedName(IntPtr window, string[] names)
+    {
+        if (Matches(ReadText(window), names)) return true;
+        bool found = false;
+        EnumChildWindows(window, delegate(IntPtr child, IntPtr ignored) {
+            if (Matches(ReadText(child), names)) found = true;
+            return !found;
+        }, IntPtr.Zero);
+        return found;
+    }
+
+    private static bool Matches(string text, string[] names)
+    {
+        if (String.IsNullOrEmpty(text)) return false;
+        foreach (string name in names)
+        {
+            if (!String.IsNullOrEmpty(name) &&
+                text.IndexOf(name, StringComparison.OrdinalIgnoreCase) >= 0)
+                return true;
+        }
+        return false;
+    }
+
+    public static void Start(string[] names, int timeoutMilliseconds)
+    {
+        ThreadPool.QueueUserWorkItem(delegate {
+            DateTime until = DateTime.UtcNow.AddMilliseconds(timeoutMilliseconds);
+            while (DateTime.UtcNow < until)
+            {
+                EnumWindows(delegate(IntPtr window, IntPtr ignored) {
+                    if (!IsWindowVisible(window)) return true;
+                    string title = ReadText(window);
+                    bool isDeleteConfirmation =
+                        title.IndexOf("Confirmar la eliminación del archivo", StringComparison.OrdinalIgnoreCase) >= 0 ||
+                        title.IndexOf("Confirm File Delete", StringComparison.OrdinalIgnoreCase) >= 0;
+                    if (isDeleteConfirmation && ContainsSelectedName(window, names))
+                    {
+                        IntPtr yes = GetDlgItem(window, IDYES);
+                        if (yes != IntPtr.Zero)
+                            SendMessage(yes, BM_CLICK, IntPtr.Zero, IntPtr.Zero);
+                    }
+                    return true;
+                }, IntPtr.Zero);
+                Thread.Sleep(40);
+            }
+        });
+    }
+}
+"""
 
 
 @dataclass(frozen=True)
@@ -297,11 +383,6 @@ def delete_mobile_images(images: list[MobileImage]) -> tuple[set[MobileImage], l
     $records = [Text.Encoding]::UTF8.GetString([Convert]::FromBase64String({_powershell_string(encoded_rows)})) | ConvertFrom-Json
     $shell = New-Object -ComObject Shell.Application
     $pending = New-Object System.Collections.Generic.List[object]
-    $confirmationKey = 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Policies\Explorer'
-    $confirmationName = 'ConfirmFileDelete'
-    $keyExisted = Test-Path -LiteralPath $confirmationKey
-    $hadConfirmationValue = $false
-    $previousConfirmationValue = $null
 
     function Open-MobileFolder([object]$record) {{
         # La ruta Self.Path de una carpeta MTP solo es válida para la sesión que
@@ -319,24 +400,19 @@ def delete_mobile_images(images: list[MobileImage]) -> tuple[set[MobileImage], l
         return $folder
     }}
 
-    # La aplicación ya muestra una única confirmación para toda la selección.
-    # Este ajuste de Explorer se desactiva de forma temporal para que InvokeVerb
-    # no abra un cuadro adicional por cada archivo MTP y se restaura enseguida.
-    try {{
-        try {{
-            $existing = Get-ItemProperty -LiteralPath $confirmationKey -Name $confirmationName -ErrorAction SilentlyContinue
-            if ($null -ne $existing) {{
-                $hadConfirmationValue = $true
-                $previousConfirmationValue = $existing.$confirmationName
-            }}
-            if (-not $keyExisted) {{ New-Item -Path $confirmationKey -Force | Out-Null }}
-            New-ItemProperty -LiteralPath $confirmationKey -Name $confirmationName -PropertyType DWord -Value 0 -Force | Out-Null
-        }} catch {{
-            # Si una política corporativa impide cambiarlo, se conserva el
-            # comportamiento de Windows en lugar de bloquear el borrado.
-        }}
+    # MTP muestra este cuadro por cada InvokeVerb incluso cuando ya existe una
+    # confirmación propia en la aplicación. El asistente solo pulsa "Sí" en
+    # diálogos cuyo texto contiene el nombre de una imagen que el usuario ya
+    # seleccionó; no toca otros diálogos de Windows.
+    $dialogCloser = @'
+{DIALOG_CLOSER_CSHARP}
+'@
+    if (-not ('MobileDeleteDialogCloser' -as [type])) {{
+        Add-Type -TypeDefinition $dialogCloser -ErrorAction Stop
+    }}
+    [MobileDeleteDialogCloser]::Start([string[]]@($records | ForEach-Object {{ [string]$_.name }}), 90000)
 
-        foreach ($record in $records) {{
+    foreach ($record in $records) {{
             try {{
                 $folder = Open-MobileFolder $record
                 $item = $folder.ParseName([string]$record.name)
@@ -357,16 +433,6 @@ def delete_mobile_images(images: list[MobileImage]) -> tuple[set[MobileImage], l
             }} catch {{
                 [PSCustomObject]@{{ device = $record.device; relative = $record.relative; name = $record.name; deleted = $false; error = $_.Exception.Message }} | ConvertTo-Json -Compress
             }}
-        }}
-    }} finally {{
-        try {{
-            if ($hadConfirmationValue) {{
-                New-ItemProperty -LiteralPath $confirmationKey -Name $confirmationName -PropertyType DWord -Value $previousConfirmationValue -Force | Out-Null
-            }} else {{
-                Remove-ItemProperty -LiteralPath $confirmationKey -Name $confirmationName -ErrorAction SilentlyContinue
-                if (-not $keyExisted) {{ Remove-Item -LiteralPath $confirmationKey -Force -ErrorAction SilentlyContinue }}
-            }}
-        }} catch {{}}
     }}
 
     # InvokeVerb inicia una operación asíncrona para MTP. No se borra la copia
