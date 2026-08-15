@@ -151,4 +151,5 @@ confirma su desaparición. No utiliza ninguna foto existente:
 
 ```powershell
 python tests\\manual_mtp_delete_smoke.py
+python tests\\manual_mtp_delete_smoke.py --count 10
 ```

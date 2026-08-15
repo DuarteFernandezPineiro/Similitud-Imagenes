@@ -670,7 +670,9 @@ def copy_images_from_device(
                 copy_errors.append(f"{row.get('name', 'Archivo')}: {row.get('error', 'No se pudo copiar')}")
 
     exit_code = process.wait()
+    process.stdout.close()
     stderr_reader.join(timeout=2)
+    process.stderr.close()
     script_path.unlink(missing_ok=True)
     stderr = "".join(stderr_chunks)
     if exit_code and not mapping:
@@ -710,7 +712,9 @@ def delete_mobile_images(
     script = f"""
     $ErrorActionPreference = 'Continue'
     [Console]::OutputEncoding = [System.Text.UTF8Encoding]::new($false)
-    $records = @([Text.Encoding]::UTF8.GetString([Convert]::FromBase64String({_powershell_string(encoded_rows)})) | ConvertFrom-Json)
+    $decodedRecords = [Text.Encoding]::UTF8.GetString([Convert]::FromBase64String({_powershell_string(encoded_rows)})) | ConvertFrom-Json
+    $records = New-Object System.Collections.Generic.List[object]
+    foreach ($decodedRecord in $decodedRecords) {{ [void]$records.Add($decodedRecord) }}
     $shell = New-Object -ComObject Shell.Application
     $folders = @{{}}
     $candidates = New-Object System.Collections.Generic.List[object]
@@ -862,7 +866,9 @@ def delete_mobile_images(
             if on_progress:
                 on_progress(processed, len(images), image.name)
     exit_code = process.wait()
+    process.stdout.close()
     stderr_reader.join(timeout=2)
+    process.stderr.close()
     script_path.unlink(missing_ok=True)
     if exit_code and not failures:
         failures.append("".join(stderr_chunks).strip() or "Windows no pudo borrar los archivos del móvil.")

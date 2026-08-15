@@ -29,6 +29,7 @@ from movil_windows import (  # noqa: E402
     _save_manifest,
     _start_powershell_script,
     copy_images_from_device,
+    delete_mobile_images,
 )
 
 
@@ -175,6 +176,26 @@ class NativeBatchDeletionTests(unittest.TestCase):
             self.assertIn('"success":true', stdout.lower())
             self.assertFalse(first.exists())
             self.assertFalse(second.exists())
+
+    def test_public_delete_pipeline_flattens_and_deletes_multiple_records(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            paths = [root / f"lote-{position}.jpg" for position in range(3)]
+            for path in paths:
+                path.write_bytes(b"prueba")
+            images = [
+                MobileImage(str(path), str(root), "", path.name, path.stat().st_size)
+                for path in paths
+            ]
+            progress: list[tuple[int, int, str]] = []
+            deleted, failures = delete_mobile_images(
+                images,
+                lambda position, total, name: progress.append((position, total, name)),
+            )
+            self.assertEqual(set(images), deleted)
+            self.assertEqual([], failures)
+            self.assertEqual([1, 2, 3], [position for position, _, _ in progress])
+            self.assertTrue(all(not path.exists() for path in paths))
 
 
 if __name__ == "__main__":
