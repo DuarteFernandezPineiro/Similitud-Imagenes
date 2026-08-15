@@ -28,13 +28,18 @@ Tras instalar las dependencias, inicia la aplicación con:
 python interfaz.py
 ```
 
-Permite seleccionar la carpeta y el umbral, revisar un grupo cada vez y elegir
-cuántas imágenes se muestran por fila. Un clic selecciona o deselecciona una
-imagen para borrado y una pulsación mantenida la abre a pantalla completa.
-La ventana ampliada se cierra inmediatamente con `Esc`. El botón
-`Ver grupos` muestra una galería desplazable de todos los grupos y cada tarjeta
-abre directamente la revisión de ese grupo. El borrado siempre requiere una
-confirmación explícita.
+La pantalla guía el proceso en tres pasos: elegir una carpeta (el análisis
+empieza automáticamente), revisar los grupos y borrar solo las fotos elegidas.
+Permite escoger el umbral y cuántas imágenes se muestran por fila. Un clic
+selecciona o deselecciona una imagen para borrado y una pulsación mantenida la
+abre a pantalla completa. La ventana ampliada se cierra inmediatamente con
+`Esc`.
+
+Mientras se realiza el primer análisis aparecen grupos utilizables: pueden
+revisarse, seleccionarse y borrarse sin esperar al final. Las actualizaciones
+se aplican al avanzar al siguiente grupo o al pulsar `Ver grupos`, para no
+interrumpir la revisión actual. El borrado siempre requiere una confirmación
+explícita y elimina los archivos de forma permanente.
 
 ### Línea de comandos
 
