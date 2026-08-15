@@ -10,14 +10,22 @@ import time
 import tkinter as tk
 from collections import deque
 from concurrent.futures import Future, ThreadPoolExecutor
+from functools import lru_cache
 from pathlib import Path
 from tkinter import filedialog, messagebox, ttk
 from typing import Any
 
 from PIL import Image, ImageOps, ImageTk, UnidentifiedImageError
 
-from agrupar_imagenes import ALLOWED_THRESHOLDS, AnalysisProgress, AnalysisResult, analyze_folder
-from movil_windows import MobileDevice, MobileImage, connected_devices, copy_images_from_device, delete_mobile_images
+from agrupar_imagenes import ALLOWED_THRESHOLDS, AnalysisProgress, AnalysisResult, ImageFile, analyze_folder
+from movil_windows import (
+    MobileDevice,
+    MobileImage,
+    MobileProgress,
+    connected_devices,
+    copy_images_from_device,
+    delete_mobile_images,
+)
 
 
 HOLD_TO_ENLARGE_MS = 500
@@ -31,8 +39,13 @@ BORDER = "#DCE3EE"
 DANGER = "#C8332D"
 
 
-def load_thumbnail(path_as_text: str, maximum_size: tuple[int, int]) -> Image.Image | None:
-    """Abre una miniatura fuera del hilo de la interfaz para mantenerla ágil."""
+@lru_cache(maxsize=512)
+def _load_thumbnail_cached(
+    path_as_text: str,
+    size: int,
+    modified_ns: int,
+    maximum_size: tuple[int, int],
+) -> Image.Image | None:
     try:
         with Image.open(path_as_text) as image:
             image = ImageOps.exif_transpose(image).convert("RGB")
@@ -43,6 +56,15 @@ def load_thumbnail(path_as_text: str, maximum_size: tuple[int, int]) -> Image.Im
             return canvas
     except (OSError, UnidentifiedImageError, ValueError):
         return None
+
+
+def load_thumbnail(path_as_text: str, maximum_size: tuple[int, int]) -> Image.Image | None:
+    """Abre y memoriza miniaturas sin bloquear el hilo de la interfaz."""
+    try:
+        metadata = Path(path_as_text).stat()
+    except OSError:
+        return None
+    return _load_thumbnail_cached(path_as_text, metadata.st_size, metadata.st_mtime_ns, maximum_size)
 
 
 class SimilarityApp(tk.Tk):
@@ -71,7 +93,8 @@ class SimilarityApp(tk.Tk):
         self.tiles: dict[tuple[int, str], tuple[tk.Frame, tk.Label]] = {}
         self.photos: dict[tuple[int, str], ImageTk.PhotoImage] = {}
         self.events: queue.Queue[tuple[Any, ...]] = queue.Queue()
-        self.thumbnail_pool = ThreadPoolExecutor(max_workers=4, thread_name_prefix="miniaturas")
+        thumbnail_workers = max(4, min(8, os.cpu_count() or 4))
+        self.thumbnail_pool = ThreadPoolExecutor(max_workers=thumbnail_workers, thread_name_prefix="miniaturas")
         self.pending_thumbnails: deque[tuple[int, int, str, tuple[int, int]]] = deque()
         self.active_thumbnails = 0
         self.analysis_run_id = 0
@@ -80,6 +103,8 @@ class SimilarityApp(tk.Tk):
         self.delete_in_progress = False
         self.mobile_lookup_id = 0
         self.mobile_sources: dict[str, MobileImage] = {}
+        self.current_mobile_device: MobileDevice | None = None
+        self.mobile_inventory: list[ImageFile] | None = None
         self.live_signature: tuple[tuple[str, ...], ...] = ()
         self.pending_live_groups: list[list[str]] | None = None
         self.last_live_render = 0.0
@@ -148,7 +173,7 @@ class SimilarityApp(tk.Tk):
         columns.grid(row=1, column=2, sticky="w", pady=(2, 0))
         columns.bind("<<ComboboxSelected>>", self._change_columns)
         self.analyze_button = tk.Button(
-            options, text="Actualizar", command=self._start_analysis, relief="flat", borderwidth=0,
+            options, text="Actualizar", command=self._refresh_source, relief="flat", borderwidth=0,
             background=ACCENT_LIGHT, foreground="#1D4ED8", activebackground="#D8E6FF", activeforeground="#1D4ED8",
             disabledforeground="#8BA3C7", cursor="hand2", font=("Segoe UI", 9, "bold"), padx=12, pady=7,
         )
@@ -227,6 +252,14 @@ class SimilarityApp(tk.Tk):
             self.folder.set(folder)
             self.folder_display.set(folder)
             self.mobile_sources.clear()
+            self.current_mobile_device = None
+            self.mobile_inventory = None
+            self._start_analysis()
+
+    def _refresh_source(self) -> None:
+        if self.current_mobile_device is not None:
+            self._start_mobile_import(self.current_mobile_device, force_refresh=True)
+        else:
             self._start_analysis()
 
     def _choose_mobile(self) -> None:
@@ -290,7 +323,7 @@ class SimilarityApp(tk.Tk):
             device_button.pack(fill="x", pady=(0, 8))
         chooser.grab_set()
 
-    def _start_mobile_import(self, device: MobileDevice) -> None:
+    def _start_mobile_import(self, device: MobileDevice, *, force_refresh: bool = False) -> None:
         if self.analysis_running:
             return
         self.analysis_running = True
@@ -303,25 +336,45 @@ class SimilarityApp(tk.Tk):
         self.progress.configure(mode="indeterminate", value=0)
         self.progress.start(12)
 
-        def progress(position: int, total: int, name: str) -> None:
-            self.events.put(("mobile_copy", current_run, position, total, name))
+        def progress(update: MobileProgress) -> None:
+            self.events.put(("mobile_copy", current_run, update))
 
         def work() -> None:
             try:
-                mirror, sources = copy_images_from_device(device, progress)
+                mirror, sources = copy_images_from_device(device, progress, force_refresh=force_refresh)
                 self.events.put(("mobile_ready", current_run, device, mirror, sources, None))
             except Exception as error:
                 self.events.put(("mobile_ready", current_run, device, None, {}, error))
 
         threading.Thread(target=work, daemon=True, name="copiar-fotos-movil").start()
 
-    def _show_mobile_copy(self, event_run: int, position: int, total: int, name: str) -> None:
+    def _show_mobile_copy(self, event_run: int, update: MobileProgress) -> None:
         if event_run != self.analysis_run_id or not self.analysis_running:
             return
+        if update.phase == "scan":
+            self.progress.configure(mode="indeterminate")
+            self.progress.start(12)
+            self.status.set(f"Explorando el móvil: {update.processed:,} fotos localizadas…")
+            self.summary.set(f"Carpeta: {update.detail}")
+            return
         self.progress.stop()
-        self.progress.configure(mode="determinate", maximum=max(1, total), value=min(position, total))
-        self.status.set(f"Copiando fotos del móvil: {position:,} de {total:,}")
-        self.summary.set(f"Preparando: {name}")
+        self.progress.configure(
+            mode="determinate",
+            maximum=max(1, update.total),
+            value=min(update.processed, update.total),
+        )
+        if update.phase == "cache":
+            self.status.set(f"Caché lista: {update.total:,} fotos disponibles al instante.")
+            self.summary.set("Pulsa «Actualizar» para buscar cambios en el dispositivo.")
+        elif update.phase == "prepare":
+            self.status.set(f"Se encontraron {update.total:,} fotos; comprobando la caché…")
+            self.summary.set("Solo se transferirán imágenes nuevas o modificadas.")
+        elif update.phase == "reuse":
+            self.status.set(f"Comprobando caché: {update.processed:,} de {update.total:,}")
+            self.summary.set(f"Reutilizada: {update.detail}")
+        else:
+            self.status.set(f"Copiando cambios del móvil: {update.processed:,} de {update.total:,}")
+            self.summary.set(f"Copiando: {update.detail}")
 
     def _finish_mobile_import(
         self,
@@ -341,7 +394,12 @@ class SimilarityApp(tk.Tk):
             self.status.set("No se pudieron preparar las fotos del móvil.")
             messagebox.showerror("No se pudo leer el móvil", str(error or "Error desconocido"), parent=self)
             return
-        self.mobile_sources = {str(Path(path).resolve()): source for path, source in sources.items()}
+        self.mobile_sources = {os.path.abspath(path): source for path, source in sources.items()}
+        self.current_mobile_device = device
+        self.mobile_inventory = [
+            ImageFile(path, source.size, source.revision)
+            for path, source in self.mobile_sources.items()
+        ]
         self.folder.set(str(mirror))
         self.folder_display.set(f"Móvil conectado: {device.name}")
         self.status.set("Fotos copiadas. Calculando grupos…")
@@ -377,7 +435,7 @@ class SimilarityApp(tk.Tk):
             self.after_cancel(self.live_update_timer)
             self.live_update_timer = None
         self._render_current_group()
-        workers = max(1, min(os.cpu_count() or 1, 4))
+        workers = max(1, min(os.cpu_count() or 1, 8))
 
         def work() -> None:
             try:
@@ -386,6 +444,7 @@ class SimilarityApp(tk.Tk):
                     self.threshold.get(),
                     workers,
                     lambda progress: self.events.put(("progress", current_run, progress)),
+                    self.mobile_inventory,
                 )
                 self.events.put(("analysis", current_run, result, None))
             except Exception as error:  # Se muestra al usuario sin cerrar la aplicación.
@@ -395,7 +454,7 @@ class SimilarityApp(tk.Tk):
 
     def _consume_events(self) -> None:
         latest_progress: tuple[int, AnalysisProgress] | None = None
-        latest_mobile_copy: tuple[int, int, int, str] | None = None
+        latest_mobile_copy: tuple[int, MobileProgress] | None = None
         try:
             while True:
                 event = self.events.get_nowait()
@@ -406,11 +465,13 @@ class SimilarityApp(tk.Tk):
                 elif event[0] == "mobile_devices":
                     self._show_mobile_devices(*event[1:])
                 elif event[0] == "mobile_copy":
-                    latest_mobile_copy = (event[1], event[2], event[3], event[4])
+                    latest_mobile_copy = (event[1], event[2])
                 elif event[0] == "mobile_ready":
                     self._finish_mobile_import(*event[1:])
                 elif event[0] == "mobile_deletion":
                     self._finish_mobile_deletion(*event[1:])
+                elif event[0] == "mobile_delete_progress":
+                    self._show_mobile_deletion_progress(*event[1:])
                 elif event[0] == "thumbnail":
                     self._show_thumbnail(*event[1:])
         except queue.Empty:
@@ -511,11 +572,9 @@ class SimilarityApp(tk.Tk):
         self._replace_live_groups(groups, keep_current=self.view_mode == "group")
 
     def _existing_groups(self, groups: list[list[str]]) -> list[list[str]]:
-        return [
-            existing
-            for group in groups
-            if len(existing := [path for path in group if Path(path).is_file()]) > 1
-        ]
+        # Los grupos en directo solo contienen hashes calculados con éxito. No
+        # se repiten miles de consultas al sistema de archivos en cada lote.
+        return [list(group) for group in groups if len(group) > 1]
 
     def _replace_live_groups(self, groups: list[list[str]], keep_current: bool = False) -> None:
         previous_paths: list[str] = []
@@ -629,44 +688,66 @@ class SimilarityApp(tk.Tk):
 
         self.current_group_text.set(f"Vista de grupos · {len(self.groups)} grupos")
         self._set_navigation_state()
-        for group_id, paths in enumerate(self.groups):
-            card = tk.Frame(self.gallery, background=CARD_BACKGROUND, highlightbackground=BORDER, highlightthickness=1, cursor="hand2")
-            card.pack(fill="x", pady=(0, 14), padx=(0, 12))
-            header = tk.Frame(card, background=CARD_BACKGROUND, padx=14, pady=11, cursor="hand2")
-            header.pack(fill="x")
-            heading = tk.Label(
-                header, text=f"Grupo {group_id + 1} · {len(paths)} imagen{'es' if len(paths) != 1 else ''}",
-                background=CARD_BACKGROUND, foreground=TEXT_PRIMARY, font=("Segoe UI", 12, "bold"), anchor="w", cursor="hand2",
-            )
-            heading.pack(side="left")
-            open_label = tk.Label(
-                header, text="Revisar  →", background=ACCENT_LIGHT, foreground="#1D4ED8",
-                font=("Segoe UI", 9, "bold"), padx=9, pady=4, cursor="hand2",
-            )
-            open_label.pack(side="right")
-            grid = tk.Frame(card, background=CARD_BACKGROUND, padx=12, pady=12, cursor="hand2")
-            grid.pack(fill="x")
-            for widget in (card, header, heading, open_label, grid):
-                widget.bind("<ButtonRelease-1>", lambda event, selected_group=group_id: self._open_group(selected_group))
-            for index, path in enumerate(paths):
-                row, column = divmod(index, 6)
-                tile_box = tk.Frame(
-                    grid, background="#111827", width=166, height=142,
-                    highlightbackground=BORDER, highlightthickness=2, cursor="hand2",
-                )
-                tile_box.grid(row=row, column=column, padx=5, pady=5, sticky="n")
-                tile_box.grid_propagate(False)
-                tile_box.pack_propagate(False)
-                tile = tk.Label(tile_box, text="Cargando…", background="#111827", foreground="#D9E2F0", cursor="hand2")
-                tile.pack(fill="both", expand=True)
-                for widget in (tile_box, tile):
-                    widget.bind("<ButtonRelease-1>", lambda event, selected_group=group_id: self._open_group(selected_group))
-                self.tiles[(group_id, path)] = (tile_box, tile)
-                self.pending_thumbnails.append((thumbnail_run, group_id, path, (156, 132)))
+        self.canvas.yview_moveto(self.overview_scroll_position)
+        self.after_idle(lambda: self._append_overview_chunk(thumbnail_run, 0))
+
+    def _append_overview_chunk(self, thumbnail_run: int, start: int) -> None:
+        """Crea la vista general por bloques para no congelar Tk con miles de widgets."""
+        if self.view_mode != "overview" or thumbnail_run != self.gallery_run_id:
+            return
+        end = min(start + 24, len(self.groups))
+        for group_id in range(start, end):
+            self._create_overview_card(group_id, self.groups[group_id], thumbnail_run)
         self._start_thumbnail_jobs(thumbnail_run)
         self.update_idletasks()
-        self.canvas.yview_moveto(self.overview_scroll_position)
-        self.after(120, lambda: self._restore_overview_scroll(thumbnail_run))
+        if end < len(self.groups):
+            self.after(1, lambda: self._append_overview_chunk(thumbnail_run, end))
+        else:
+            self.after(30, lambda: self._restore_overview_scroll(thumbnail_run))
+
+    def _create_overview_card(self, group_id: int, paths: list[str], thumbnail_run: int) -> None:
+        card = tk.Frame(self.gallery, background=CARD_BACKGROUND, highlightbackground=BORDER, highlightthickness=1, cursor="hand2")
+        card.pack(fill="x", pady=(0, 14), padx=(0, 12))
+        header = tk.Frame(card, background=CARD_BACKGROUND, padx=14, pady=11, cursor="hand2")
+        header.pack(fill="x")
+        heading = tk.Label(
+            header, text=f"Grupo {group_id + 1} · {len(paths)} imagen{'es' if len(paths) != 1 else ''}",
+            background=CARD_BACKGROUND, foreground=TEXT_PRIMARY, font=("Segoe UI", 12, "bold"), anchor="w", cursor="hand2",
+        )
+        heading.pack(side="left")
+        open_label = tk.Label(
+            header, text="Revisar  →", background=ACCENT_LIGHT, foreground="#1D4ED8",
+            font=("Segoe UI", 9, "bold"), padx=9, pady=4, cursor="hand2",
+        )
+        open_label.pack(side="right")
+        grid = tk.Frame(card, background=CARD_BACKGROUND, padx=12, pady=12, cursor="hand2")
+        grid.pack(fill="x")
+        for widget in (card, header, heading, open_label, grid):
+            widget.bind("<ButtonRelease-1>", lambda event, selected_group=group_id: self._open_group(selected_group))
+        preview_paths = paths[:12]
+        for index, path in enumerate(preview_paths):
+            row, column = divmod(index, 6)
+            tile_box = tk.Frame(
+                grid, background="#111827", width=166, height=142,
+                highlightbackground=BORDER, highlightthickness=2, cursor="hand2",
+            )
+            tile_box.grid(row=row, column=column, padx=5, pady=5, sticky="n")
+            tile_box.grid_propagate(False)
+            tile_box.pack_propagate(False)
+            tile = tk.Label(tile_box, text="Cargando…", background="#111827", foreground="#D9E2F0", cursor="hand2")
+            tile.pack(fill="both", expand=True)
+            for widget in (tile_box, tile):
+                widget.bind("<ButtonRelease-1>", lambda event, selected_group=group_id: self._open_group(selected_group))
+            self.tiles[(group_id, path)] = (tile_box, tile)
+            self.pending_thumbnails.append((thumbnail_run, group_id, path, (156, 132)))
+        if len(paths) > len(preview_paths):
+            tk.Label(
+                grid,
+                text=f"+ {len(paths) - len(preview_paths)} imágenes más al abrir el grupo",
+                background=CARD_BACKGROUND,
+                foreground=TEXT_SECONDARY,
+                font=("Segoe UI", 9, "italic"),
+            ).grid(row=2, column=0, columnspan=6, sticky="w", padx=5, pady=(7, 0))
 
     def _restore_overview_scroll(self, thumbnail_run: int) -> None:
         if self.view_mode != "overview" or thumbnail_run != self.gallery_run_id:
@@ -870,6 +951,8 @@ class SimilarityApp(tk.Tk):
             self.delete_in_progress = True
             self.status.set("Eliminando las imágenes del móvil y verificando el resultado…")
             self.summary.set("No desconectes ni bloquees el móvil durante el borrado.")
+            self.progress.stop()
+            self.progress.configure(mode="determinate", maximum=max(1, len(mobile_selected)), value=0)
             self._set_navigation_state()
             local_selected = selected - set(mobile_selected)
 
@@ -877,7 +960,13 @@ class SimilarityApp(tk.Tk):
                 deleted: set[str] = set()
                 failures: list[str] = []
                 try:
-                    deleted_mobile, mobile_failures = delete_mobile_images(list(mobile_selected.values()))
+                    def report(position: int, total: int, name: str) -> None:
+                        self.events.put(("mobile_delete_progress", position, total, name))
+
+                    deleted_mobile, mobile_failures = delete_mobile_images(
+                        list(mobile_selected.values()),
+                        report,
+                    )
                     failures.extend(mobile_failures)
                     for path, source in mobile_selected.items():
                         if source not in deleted_mobile:
@@ -910,10 +999,20 @@ class SimilarityApp(tk.Tk):
                 failures.append(f"{Path(path).name}: {error}")
         self._apply_deletion(group_id, deleted, failures)
 
+    def _show_mobile_deletion_progress(self, position: int, total: int, name: str) -> None:
+        if not self.delete_in_progress:
+            return
+        self.progress.configure(mode="determinate", maximum=max(1, total), value=min(position, total))
+        self.status.set(f"Borrando y verificando: {position:,} de {total:,}")
+        self.summary.set(f"Procesada: {name}")
+
     def _finish_mobile_deletion(self, group_id: int, deleted: set[str], failures: list[str]) -> None:
         self.delete_in_progress = False
+        self.progress.configure(mode="determinate", maximum=100, value=100)
         for path in deleted:
             self.mobile_sources.pop(path, None)
+        if deleted and self.mobile_inventory is not None:
+            self.mobile_inventory = [file for file in self.mobile_inventory if file.path not in deleted]
         self._apply_deletion(group_id, deleted, failures)
 
     def _apply_deletion(self, group_id: int, deleted: set[str], failures: list[str]) -> None:

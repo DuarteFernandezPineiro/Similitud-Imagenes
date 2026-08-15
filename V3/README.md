@@ -53,7 +53,15 @@ se omiten porque Android/MTP suele impedir su lectura o bloquear el recorrido.
 Solo se copian temporalmente imágenes compatibles a una caché local en
 `%LOCALAPPDATA%\\SimilitudImagenes\\moviles`; los vídeos no se copian. Después
 se analizan y revisan como las imágenes de una carpeta normal. La caché se
-reutiliza entre ejecuciones, reduciendo transferencias posteriores.
+reutiliza entre ejecuciones. Un manifiesto persistente permite abrir de forma
+inmediata una galería ya preparada, sin volver a recorrer miles de entradas
+MTP ni consultar cada copia local. El botón **Actualizar** fuerza un recorrido
+completo para incorporar fotos nuevas, modificadas o eliminadas fuera de V3.
+
+Durante ese recorrido se muestra la carpeta actual y el número de imágenes ya
+localizadas. V3 compara el tamaño remoto con la copia local y transfiere solo
+los cambios; el análisis recibe directamente el mismo inventario, por lo que
+no vuelve a recorrer la caché una segunda vez.
 
 El botón de eliminar solo actúa sobre los originales seleccionados después de
 una confirmación explícita. La interfaz conserva las miniaturas locales hasta
@@ -62,9 +70,11 @@ tiene que permanecer encendido, desbloqueado y conectado durante la importación
 y durante un borrado.
 
 Al borrar varias imágenes, V3 solicita una única confirmación para la selección
-completa. Si el proveedor MTP muestra su propio aviso por cada archivo, V3 lo
-acepta automáticamente solo cuando el aviso contiene el nombre de una imagen
-que ya fue seleccionada; no interactúa con otros avisos de Windows.
+completa. Después entrega todos los elementos juntos a `IFileOperation` con
+`FOF_NOCONFIRMATION`, de modo que Windows realiza una sola operación silenciosa
+y no muestra un aviso por archivo. El resultado se comprueba en el dispositivo
+antes de retirar las miniaturas. Para proveedores MTP antiguos que rechacen esa
+API existe un fallback restringido a los nombres ya confirmados por el usuario.
 
 ### Línea de comandos
 
@@ -112,3 +122,33 @@ usa un índice por fragmentos del hash para obtener únicamente candidatas y se
 verifica la distancia exacta antes de unirlas. Así se evita comparar cada foto
 contra todas las demás, algo inviable con 100.000 imágenes. Las imágenes que
 conectan entre sí por encima del umbral se incluyen en el mismo grupo.
+
+Las miniaturas se decodifican en paralelo y se conservan en memoria. La vista
+general se construye por bloques y muestra como máximo doce vistas previas por
+grupo, manteniendo accesibles todas las imágenes al abrirlo sin congelar la
+interfaz cuando existen cientos de grupos.
+
+## Pruebas
+
+Las pruebas automáticas comprueban el índice contra una comparación exhaustiva
+en todos los umbrales, el manifiesto móvil y un borrado nativo real de archivos
+temporales sin avisos del Shell:
+
+```powershell
+python -m unittest discover -s tests -v
+```
+
+Con un teléfono conectado se puede medir el refresco completo y la reapertura
+desde caché sin borrar contenido:
+
+```powershell
+python tests\\manual_mtp_smoke.py
+```
+
+La prueba de borrado crea una imagen azul con un nombre UUID dentro de
+`Pictures`, la elimina mediante el mismo lote nativo y comprueba que el móvil
+confirma su desaparición. No utiliza ninguna foto existente:
+
+```powershell
+python tests\\manual_mtp_delete_smoke.py
+```

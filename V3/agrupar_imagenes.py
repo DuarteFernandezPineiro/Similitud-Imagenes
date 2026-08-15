@@ -15,6 +15,7 @@ from array import array
 from collections import defaultdict
 from concurrent.futures import ProcessPoolExecutor
 from dataclasses import dataclass
+from functools import lru_cache
 from itertools import combinations, islice
 from pathlib import Path
 from typing import Callable, Iterable, Iterator
@@ -80,6 +81,13 @@ class CachedHash:
     value: int
 
 
+@dataclass(frozen=True)
+class CachedFailure:
+    size: int
+    modified_ns: int
+    error: str
+
+
 def stored_hash_parts(image_hash: int) -> tuple[int, int, int, int, int, int, int]:
     """Fragmentos indexados por SQLite para los planes de búsqueda 80/90/95%."""
     return (
@@ -98,6 +106,12 @@ class HashCache:
 
     def __init__(self, path: Path) -> None:
         self.connection = sqlite3.connect(path)
+        # WAL evita bloqueos largos al actualizar la caché y NORMAL reduce
+        # sincronizaciones de disco sin comprometer la integridad transaccional.
+        self.connection.execute("PRAGMA journal_mode=WAL")
+        self.connection.execute("PRAGMA synchronous=NORMAL")
+        self.connection.execute("PRAGMA temp_store=MEMORY")
+        self.connection.execute("PRAGMA cache_size=-32768")
         self.connection.execute(
             """
             CREATE TABLE IF NOT EXISTS image_hashes (
@@ -119,6 +133,16 @@ class HashCache:
         self.connection.execute(
             "CREATE TABLE IF NOT EXISTS group_state (id INTEGER PRIMARY KEY CHECK (id = 1), threshold INTEGER NOT NULL)"
         )
+        self.connection.execute(
+            """
+            CREATE TABLE IF NOT EXISTS unreadable_files (
+                path TEXT PRIMARY KEY,
+                size INTEGER NOT NULL,
+                modified_ns INTEGER NOT NULL,
+                error TEXT NOT NULL
+            )
+            """
+        )
         existing_columns = {row[1] for row in self.connection.execute("PRAGMA table_info(image_hashes)")}
         for name in ("group_id", "p16_0", "p16_1", "p16_2", "p16_3", "p21_0", "p21_1", "p21_2"):
             if name not in existing_columns:
@@ -138,6 +162,40 @@ class HashCache:
                 "SELECT path, size, modified_ns, value FROM image_hashes"
             )
         }
+
+    def read_unreadable(self) -> dict[str, CachedFailure]:
+        return {
+            path: CachedFailure(size, modified_ns, error)
+            for path, size, modified_ns, error in self.connection.execute(
+                "SELECT path, size, modified_ns, error FROM unreadable_files"
+            )
+        }
+
+    def save_unreadable(self, failures: dict[str, tuple[ImageFile, str]]) -> None:
+        if not failures:
+            return
+        self.connection.executemany(
+            """
+            INSERT INTO unreadable_files(path, size, modified_ns, error)
+            VALUES (?, ?, ?, ?)
+            ON CONFLICT(path) DO UPDATE SET
+                size=excluded.size,
+                modified_ns=excluded.modified_ns,
+                error=excluded.error
+            """,
+            (
+                (path, file.size, file.modified_ns, error)
+                for path, (file, error) in failures.items()
+            ),
+        )
+        self.connection.commit()
+
+    def remove_unreadable(self, paths: Iterable[str]) -> None:
+        items = list(paths)
+        if not items:
+            return
+        self.connection.executemany("DELETE FROM unreadable_files WHERE path = ?", ((path,) for path in items))
+        self.connection.commit()
 
     def _backfill_parts(self) -> None:
         rows = self.connection.execute("SELECT rowid, value FROM image_hashes WHERE p16_0 IS NULL").fetchall()
@@ -229,12 +287,15 @@ class HashCache:
 
     def records_for_paths(self, paths: Iterable[str]) -> list[tuple[int, str, int, int]]:
         result: list[tuple[int, str, int, int]] = []
-        for path in paths:
-            row = self.connection.execute(
-                "SELECT rowid, path, value, group_id FROM image_hashes WHERE path = ?", (path,)
-            ).fetchone()
-            if row:
-                result.append((row[0], row[1], int.from_bytes(row[2], "big"), row[3]))
+        items = list(paths)
+        for start in range(0, len(items), 500):
+            chunk = items[start:start + 500]
+            placeholders = ",".join("?" for _ in chunk)
+            rows = self.connection.execute(
+                f"SELECT rowid, path, value, group_id FROM image_hashes WHERE path IN ({placeholders})",
+                chunk,
+            )
+            result.extend((row[0], row[1], int.from_bytes(row[2], "big"), row[3]) for row in rows)
         return result
 
     def similar_group_ids(self, row_id: int, image_hash: int, threshold: int) -> set[int]:
@@ -273,7 +334,7 @@ class HashCache:
                         matching_groups.add(group_id)
         return matching_groups
 
-    def merge_groups(self, destination: int, group_ids: Iterable[int]) -> None:
+    def merge_groups(self, destination: int, group_ids: Iterable[int], *, commit: bool = True) -> None:
         """Fusiona únicamente los grupos que una foto nueva haya conectado."""
         source_groups = list(set(group_ids) - {destination})
         for start in range(0, len(source_groups), 500):
@@ -283,6 +344,10 @@ class HashCache:
                 f"UPDATE image_hashes SET group_id = ? WHERE group_id IN ({placeholders})",
                 (destination, *chunk),
             )
+        if commit:
+            self.connection.commit()
+
+    def commit(self) -> None:
         self.connection.commit()
 
     def grouped_paths(self) -> list[list[str]]:
@@ -325,6 +390,8 @@ def hash_images(
     batch_size = max(64, workers * 32)
     processed = 0
     total = len(files)
+    if total == 0:
+        return {}, []
 
     def store(results: Iterable[tuple[str, int | None, str | None]]) -> dict[str, int]:
         batch_hashes: dict[str, int] = {}
@@ -352,7 +419,12 @@ def hash_images(
     else:
         with ProcessPoolExecutor(max_workers=workers) as pool:
             for batch in batches(files, batch_size):
-                batch_hashes = store(pool.map(perceptual_hash, (file.path for file in batch)))
+                # Agrupar tareas reduce mucho el tráfico IPC al procesar miles
+                # de imágenes pequeñas.
+                chunk_size = max(1, min(16, len(batch) // max(1, workers * 2)))
+                batch_hashes = store(
+                    pool.map(perceptual_hash, (file.path for file in batch), chunksize=chunk_size)
+                )
                 report_progress(len(batch), batch_hashes)
                 print(f"Hasheadas nuevas/modificadas: {len(hashes):,}", end="\r", flush=True)
     print(" " * 40, end="\r")
@@ -384,22 +456,40 @@ def load_images_from_cache(
     workers: int,
     threshold: int,
     progress_callback: Callable[[AnalysisProgress], None] | None = None,
+    known_files: Iterable[ImageFile] | None = None,
 ) -> CacheSync:
     """Sincroniza la caché y actualiza solo los grupos conectados por altas nuevas."""
-    files = list(image_files(root))
+    trusted_inventory = known_files is not None
+    files = list(known_files) if known_files is not None else list(image_files(root))
     cached = cache.read_all()
+    cached_failures = cache.read_unreadable()
     current_paths = {file.path for file in files}
     new_paths = {file.path for file in files if file.path not in cached}
+
+    def changed(file: ImageFile, entry: CachedHash) -> bool:
+        # Un inventario MTP reutilizado usa modified_ns=0: el archivo local no
+        # se copió en este refresco, de modo que su hash sigue siendo válido
+        # aunque un proveedor haya informado tamaños remotos inconsistentes.
+        if trusted_inventory and file.modified_ns == 0:
+            return False
+        return entry.size != file.size or (
+            entry.modified_ns != file.modified_ns
+        )
+
     modified_paths = {
         file.path for file in files
         if (entry := cached.get(file.path)) is not None
-        and (entry.size != file.size or entry.modified_ns != file.modified_ns)
+        and changed(file, entry)
     }
     files_to_hash = [
         file for file in files
         if (entry := cached.get(file.path)) is None
-        or entry.size != file.size
-        or entry.modified_ns != file.modified_ns
+        and (
+            (failure := cached_failures.get(file.path)) is None
+            or failure.size != file.size
+            or (file.modified_ns != 0 and failure.modified_ns != file.modified_ns)
+        )
+        or entry is not None and changed(file, entry)
     ]
     # En una primera ejecución se agrupa cada lote conforme se termina de
     # hashear. Así la interfaz puede ofrecer grupos reales para revisar y
@@ -425,25 +515,52 @@ def load_images_from_cache(
             groups_found = 0
         progress_callback(AnalysisProgress(processed, total, groups, groups_found))
 
-    calculated, unreadable = hash_images(files_to_hash, workers, report_hash_progress)
+    calculated, newly_unreadable = hash_images(files_to_hash, workers, report_hash_progress)
     file_by_path = {file.path: file for file in files_to_hash}
     # La persona usuaria puede borrar una foto mientras se muestran los
     # grupos en directo. No guardamos en SQLite un hash de un archivo que ya
     # no exista o que haya cambiado durante el análisis.
-    calculated = {
-        path: image_hash
-        for path, image_hash in calculated.items()
-        if (current := _current_file_metadata(path)) is not None
-        and current == (file_by_path[path].size, file_by_path[path].modified_ns)
-    }
+    if trusted_inventory:
+        calculated = {
+            path: image_hash
+            for path, image_hash in calculated.items()
+            if Path(path).is_file()
+        }
+    else:
+        calculated = {
+            path: image_hash
+            for path, image_hash in calculated.items()
+            if (current := _current_file_metadata(path)) is not None
+            and current == (file_by_path[path].size, file_by_path[path].modified_ns)
+        }
     cache.save({path: (file_by_path[path], image_hash) for path, image_hash in calculated.items()})
 
     # Una imagen modificada que ya no se puede leer no debe conservar su hash antiguo.
-    failed_paths = {item["ruta"] for item in unreadable}
-    existing_paths = {path for path in current_paths if Path(path).is_file()}
+    new_failure_errors = {item["ruta"]: item["error"] for item in newly_unreadable}
+    cache.save_unreadable(
+        {
+            path: (file_by_path[path], error)
+            for path, error in new_failure_errors.items()
+            if path in file_by_path
+        }
+    )
+    failed_paths = set(new_failure_errors)
+    existing_paths = current_paths if trusted_inventory else {path for path in current_paths if Path(path).is_file()}
     removed_paths = set(cached) - existing_paths
     stale_paths = removed_paths | failed_paths
     cache.remove(stale_paths)
+    removed_failure_paths = set(cached_failures) - existing_paths
+    cache.remove_unreadable(set(calculated) | removed_failure_paths)
+
+    skipped_unreadable = [
+        {"ruta": file.path, "error": cached_failures[file.path].error}
+        for file in files
+        if file.path not in cached
+        and (failure := cached_failures.get(file.path)) is not None
+        and failure.size == file.size
+        and (file.modified_ns == 0 or failure.modified_ns == file.modified_ns)
+    ]
+    unreadable = skipped_unreadable + newly_unreadable
 
     successful_new_paths = new_paths & set(calculated)
     cache.initialize_groups(successful_new_paths)
@@ -472,9 +589,10 @@ def load_images_from_cache(
         for position, (row_id, _, image_hash, current_group) in enumerate(new_records, start=1):
             connected_groups = cache.similar_group_ids(row_id, image_hash, threshold)
             destination = min({current_group, *connected_groups})
-            cache.merge_groups(destination, connected_groups | {current_group})
+            cache.merge_groups(destination, connected_groups | {current_group}, commit=False)
             if position % 100 == 0 or position == len(new_records):
                 print(f"Actualizando grupos de nuevas imágenes: {position:,}/{len(new_records):,}", end="\r", flush=True)
+        cache.commit()
         print(" " * 70, end="\r")
 
     cache.set_threshold(threshold)
@@ -516,6 +634,7 @@ class SearchPlan:
     local_radius: int
 
 
+@lru_cache(maxsize=None)
 def plan_for(max_distance: int) -> SearchPlan:
     """Plan exacto: toda pareja dentro de la distancia aparecerá como candidata.
 
@@ -532,6 +651,7 @@ def plan_for(max_distance: int) -> SearchPlan:
     return SearchPlan((16, 16, 16, 16), 3)
 
 
+@lru_cache(maxsize=None)
 def masks(width: int, radius: int) -> tuple[int, ...]:
     result = [0]
     for changed_bits in range(1, radius + 1):
@@ -632,9 +752,10 @@ def group_similar_images(
     plan = plan_for(max_distance)
     per_part_masks = [masks(width, plan.local_radius) for width in plan.widths]
     index: list[dict[int, list[int]]] = [defaultdict(list) for _ in plan.widths]
+    hash_parts = [split_hash(image_hash, plan.widths) for image_hash in hashes]
 
-    for image_id, image_hash in enumerate(hashes):
-        for part, value in enumerate(split_hash(image_hash, plan.widths)):
+    for image_id, parts in enumerate(hash_parts):
+        for part, value in enumerate(parts):
             index[part][value].append(image_id)
 
     groups = UnionFind(len(hashes))
@@ -644,7 +765,7 @@ def group_similar_images(
 
     for image_id, image_hash in enumerate(hashes):
         marker += 1
-        for part, value in enumerate(split_hash(image_hash, plan.widths)):
+        for part, value in enumerate(hash_parts[image_id]):
             for mask in per_part_masks[part]:
                 for candidate_id in index[part].get(value ^ mask, ()):
                     if candidate_id <= image_id or seen[candidate_id] == marker:
@@ -678,6 +799,7 @@ def analyze_folder(
     threshold: int,
     workers: int,
     progress_callback: Callable[[AnalysisProgress], None] | None = None,
+    known_files: Iterable[ImageFile] | None = None,
 ) -> AnalysisResult:
     """Ejecuta el análisis para la línea de comandos o la interfaz gráfica."""
     root = root.expanduser().resolve()
@@ -692,7 +814,7 @@ def analyze_folder(
     try:
         cache = HashCache(cache_path)
         try:
-            sync = load_images_from_cache(root, cache, workers, threshold, progress_callback)
+            sync = load_images_from_cache(root, cache, workers, threshold, progress_callback, known_files)
             groups = cache.grouped_paths()
             image_count = cache.image_count()
         finally:

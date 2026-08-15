@@ -13,6 +13,8 @@ import hashlib
 import json
 import os
 import subprocess
+import tempfile
+import threading
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable, Iterator
@@ -23,11 +25,124 @@ IMAGE_EXTENSIONS = {
     ".png", ".tif", ".tiff", ".webp",
 }
 CACHE_MARKER = ".similitud_movil_cache"
-DIALOG_CLOSER_CSHARP = r"""
+MANIFEST_FILE = ".galeria_movil.json"
+MANIFEST_VERSION = 2
+SHELL_OPERATIONS_CSHARP = r"""
 using System;
+using System.Collections.Generic;
+using System.Runtime.InteropServices;
 using System.Text;
 using System.Threading;
-using System.Runtime.InteropServices;
+
+[ComImport]
+[Guid("43826D1E-E718-42EE-BC55-A1E261C37BFE")]
+[InterfaceType(ComInterfaceType.InterfaceIsIUnknown)]
+public interface IShellItem
+{
+    [PreserveSig] int BindToHandler(IntPtr pbc, ref Guid bhid, ref Guid riid, out IntPtr ppv);
+    [PreserveSig] int GetParent(out IShellItem ppsi);
+    [PreserveSig] int GetDisplayName(uint sigdnName, out IntPtr ppszName);
+    [PreserveSig] int GetAttributes(uint sfgaoMask, out uint psfgaoAttribs);
+    [PreserveSig] int Compare(IShellItem psi, uint hint, out int piOrder);
+}
+
+[ComImport]
+[Guid("947AAB5F-0A5C-4C13-B4D6-4BF7836FC9F8")]
+[InterfaceType(ComInterfaceType.InterfaceIsIUnknown)]
+public interface IFileOperation
+{
+    [PreserveSig] int Advise(IntPtr pfops, out uint cookie);
+    [PreserveSig] int Unadvise(uint cookie);
+    [PreserveSig] int SetOperationFlags(uint flags);
+    [PreserveSig] int SetProgressMessage([MarshalAs(UnmanagedType.LPWStr)] string message);
+    [PreserveSig] int SetProgressDialog(IntPtr popd);
+    [PreserveSig] int SetProperties(IntPtr pproparray);
+    [PreserveSig] int SetOwnerWindow(uint hwndOwner);
+    [PreserveSig] int ApplyPropertiesToItem(IShellItem item);
+    [PreserveSig] int ApplyPropertiesToItems(IntPtr items);
+    [PreserveSig] int RenameItem(IShellItem item, [MarshalAs(UnmanagedType.LPWStr)] string newName, IntPtr sink);
+    [PreserveSig] int RenameItems(IntPtr items, [MarshalAs(UnmanagedType.LPWStr)] string newName);
+    [PreserveSig] int MoveItem(IShellItem item, IShellItem destination, [MarshalAs(UnmanagedType.LPWStr)] string newName, IntPtr sink);
+    [PreserveSig] int MoveItems(IntPtr items, IShellItem destination);
+    [PreserveSig] int CopyItem(IShellItem item, IShellItem destination, [MarshalAs(UnmanagedType.LPWStr)] string copyName, IntPtr sink);
+    [PreserveSig] int CopyItems(IntPtr items, IShellItem destination);
+    [PreserveSig] int DeleteItem(IShellItem item, IntPtr sink);
+    [PreserveSig] int DeleteItems(IntPtr items);
+    [PreserveSig] int NewItem(IShellItem destination, uint attributes, [MarshalAs(UnmanagedType.LPWStr)] string name, [MarshalAs(UnmanagedType.LPWStr)] string templateName, IntPtr sink);
+    [PreserveSig] int PerformOperations();
+    [PreserveSig] int GetAnyOperationsAborted([MarshalAs(UnmanagedType.Bool)] out bool aborted);
+}
+
+[ComImport]
+[Guid("3AD05575-8857-4850-9277-11B85BDB8E09")]
+public class FileOperationComObject { }
+
+public static class MobileShellBatch
+{
+    private const uint FOF_SILENT = 0x0004;
+    private const uint FOF_NOCONFIRMATION = 0x0010;
+    private const uint FOF_NOERRORUI = 0x0400;
+    private const uint FOF_NO_CONNECTED_ELEMENTS = 0x2000;
+
+    [DllImport("shell32.dll")]
+    private static extern int SHGetIDListFromObject(
+        [MarshalAs(UnmanagedType.IUnknown)] object source, out IntPtr pidl);
+
+    [DllImport("shell32.dll")]
+    private static extern int SHCreateItemFromIDList(
+        IntPtr pidl, ref Guid riid,
+        [MarshalAs(UnmanagedType.Interface)] out IShellItem shellItem);
+
+    private static void Check(int result)
+    {
+        if (result < 0) Marshal.ThrowExceptionForHR(result);
+    }
+
+    public static bool Delete(object[] sourceItems, out string error)
+    {
+        error = String.Empty;
+        IFileOperation operation = null;
+        var shellItems = new List<IShellItem>();
+        try
+        {
+            operation = (IFileOperation)new FileOperationComObject();
+            Check(operation.SetOperationFlags(
+                FOF_SILENT | FOF_NOCONFIRMATION | FOF_NOERRORUI | FOF_NO_CONNECTED_ELEMENTS));
+            Guid shellItemId = typeof(IShellItem).GUID;
+            foreach (object source in sourceItems)
+            {
+                IntPtr pidl = IntPtr.Zero;
+                try
+                {
+                    Check(SHGetIDListFromObject(source, out pidl));
+                    IShellItem item;
+                    Check(SHCreateItemFromIDList(pidl, ref shellItemId, out item));
+                    shellItems.Add(item);
+                    Check(operation.DeleteItem(item, IntPtr.Zero));
+                }
+                finally
+                {
+                    if (pidl != IntPtr.Zero) Marshal.FreeCoTaskMem(pidl);
+                }
+            }
+            Check(operation.PerformOperations());
+            bool aborted;
+            Check(operation.GetAnyOperationsAborted(out aborted));
+            return !aborted;
+        }
+        catch (Exception exception)
+        {
+            error = exception.Message;
+            return false;
+        }
+        finally
+        {
+            foreach (IShellItem item in shellItems)
+                if (item != null && Marshal.IsComObject(item)) Marshal.FinalReleaseComObject(item);
+            if (operation != null && Marshal.IsComObject(operation)) Marshal.FinalReleaseComObject(operation);
+        }
+    }
+}
 
 public static class MobileDeleteDialogCloser
 {
@@ -123,10 +238,25 @@ class MobileImage:
     device_shell_path: str
     relative_parent: str
     name: str
+    size: int = 0
+    revision: int = 0
+
+
+@dataclass(frozen=True)
+class MobileProgress:
+    phase: str
+    processed: int
+    total: int
+    detail: str = ""
 
 
 def _powershell_string(value: str) -> str:
     return "'" + value.replace("'", "''") + "'"
+
+
+def _absolute_path(value: str | os.PathLike[str]) -> str:
+    """Normaliza una ruta local sin la costosa resolución física de cada archivo."""
+    return os.path.abspath(os.fspath(value))
 
 
 def _run_powershell(script: str) -> subprocess.CompletedProcess[str]:
@@ -141,6 +271,34 @@ def _run_powershell(script: str) -> subprocess.CompletedProcess[str]:
         errors="replace",
         text=True,
     )
+
+
+def _start_powershell_script(script: str) -> tuple[subprocess.Popen[str], Path]:
+    """Inicia un script grande sin superar el límite de la línea de comandos."""
+    if os.name != "nt":
+        raise RuntimeError("La integración con móviles por cable solo está disponible en Windows.")
+    with tempfile.NamedTemporaryFile(
+        mode="w",
+        encoding="utf-8-sig",
+        suffix=".ps1",
+        prefix="similitud-mtp-",
+        delete=False,
+    ) as temporary:
+        temporary.write(script)
+        script_path = Path(temporary.name)
+    try:
+        process = subprocess.Popen(
+            ["powershell", "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-File", str(script_path)],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+        )
+    except Exception:
+        script_path.unlink(missing_ok=True)
+        raise
+    return process, script_path
 
 
 def _json_rows(text: str) -> Iterator[dict[str, object]]:
@@ -197,14 +355,113 @@ def _prepare_cache(device: MobileDevice) -> Path:
     return cache
 
 
-def _remove_stale_cache_images(cache: Path, current_paths: set[str]) -> None:
+def _manifest_path(cache: Path) -> Path:
+    return cache / MANIFEST_FILE
+
+
+def _load_manifest(cache: Path, device: MobileDevice) -> dict[str, MobileImage]:
+    """Carga solo manifiestos completos cuyas copias locales siguen disponibles."""
+    try:
+        payload = json.loads(_manifest_path(cache).read_text(encoding="utf-8"))
+    except (OSError, ValueError, TypeError):
+        return {}
+    if not isinstance(payload, dict):
+        return {}
+    if payload.get("version") != MANIFEST_VERSION or payload.get("device") != device.shell_path:
+        return {}
+    mapping: dict[str, MobileImage] = {}
+    cache_root = Path(_absolute_path(cache))
+    for row in payload.get("images", []):
+        try:
+            local_path = _absolute_path(str(row["local_path"]))
+            local = Path(local_path)
+            if not local.is_relative_to(cache_root):
+                return {}
+            size = int(row.get("size") or 0)
+            mapping[local_path] = MobileImage(
+                local_path,
+                device.shell_path,
+                str(row.get("relative") or ""),
+                str(row["name"]),
+                size,
+                0,
+            )
+        except (KeyError, OSError, TypeError, ValueError):
+            return {}
+    # El manifiesto se escribe atómicamente después de un refresco completo.
+    # Validar una muestra detecta una caché movida/borrada sin hacer 8.000 stats.
+    paths = list(mapping)
+    sample_step = max(1, len(paths) // 16)
+    for path in paths[::sample_step]:
+        try:
+            local_size = Path(path).stat().st_size
+        except OSError:
+            return {}
+        expected_size = mapping[path].size
+        if local_size <= 0 or (expected_size > 0 and local_size != expected_size):
+            return {}
+    return mapping
+
+
+def _save_manifest(cache: Path, device: MobileDevice, mapping: dict[str, MobileImage]) -> None:
+    payload = {
+        "version": MANIFEST_VERSION,
+        "device": device.shell_path,
+        "images": [
+            {
+                "local_path": image.local_path,
+                "relative": image.relative_parent,
+                "name": image.name,
+                "size": image.size,
+            }
+            for image in mapping.values()
+        ],
+    }
+    target = _manifest_path(cache)
+    temporary = target.with_suffix(".tmp")
+    temporary.write_text(json.dumps(payload, ensure_ascii=False, separators=(",", ":")), encoding="utf-8")
+    os.replace(temporary, target)
+
+
+def _remove_manifest_images(images: set[MobileImage]) -> None:
+    """Evita que un borrado confirmado reaparezca al reutilizar la caché."""
+    by_device: dict[str, set[tuple[str, str]]] = {}
+    for image in images:
+        by_device.setdefault(image.device_shell_path, set()).add((image.relative_parent, image.name))
+    for shell_path, removed in by_device.items():
+        device = MobileDevice("", shell_path)
+        cache = _cache_directory(device)
+        mapping = _load_manifest(cache, device)
+        if not mapping:
+            continue
+        retained = {
+            path: image
+            for path, image in mapping.items()
+            if (image.relative_parent, image.name) not in removed
+        }
+        try:
+            _save_manifest(cache, device, retained)
+        except OSError:
+            pass
+
+
+def _remove_stale_cache_images(
+    cache: Path,
+    current_paths: set[str],
+    previous_paths: set[str] | None = None,
+) -> None:
     """Retira solo copias de una caché que ya no existan en el móvil."""
     if not (cache / CACHE_MARKER).is_file():
         return
-    for candidate in cache.rglob("*"):
+    cache_root = Path(_absolute_path(cache))
+    candidates = (Path(path) for path in previous_paths) if previous_paths is not None else cache.rglob("*")
+    for candidate in candidates:
         if candidate.suffix.casefold() not in IMAGE_EXTENSIONS:
             continue
-        if str(candidate.resolve()) in current_paths:
+        candidate_resolved = Path(_absolute_path(candidate))
+        if not candidate_resolved.is_relative_to(cache_root):
+            continue
+        if str(candidate_resolved) in current_paths:
             continue
         try:
             candidate.unlink()
@@ -214,8 +471,10 @@ def _remove_stale_cache_images(cache: Path, current_paths: set[str]) -> None:
 
 def copy_images_from_device(
     device: MobileDevice,
-    on_progress: Callable[[int, int, str], None] | None = None,
+    on_progress: Callable[[MobileProgress], None] | None = None,
     max_images: int | None = None,
+    *,
+    force_refresh: bool = False,
 ) -> tuple[Path, dict[str, MobileImage]]:
     """Materializa la galería pública del móvil en caché y devuelve su mapa remoto.
 
@@ -224,6 +483,15 @@ def copy_images_from_device(
     Android/media, donde se almacenan los medios de apps modernas.
     """
     destination = _prepare_cache(device).resolve()
+    previous_mapping = _load_manifest(destination, device)
+    if previous_mapping and not force_refresh:
+        mapping = previous_mapping
+        if max_images is not None:
+            mapping = dict(list(mapping.items())[:max_images])
+        if on_progress:
+            on_progress(MobileProgress("cache", len(mapping), len(mapping), "Caché local reutilizada"))
+        return destination, mapping
+
     extension_values = ",".join(_powershell_string(item) for item in sorted(IMAGE_EXTENSIONS))
     script = f"""
     $ErrorActionPreference = 'Stop'
@@ -232,22 +500,24 @@ def copy_images_from_device(
     $devicePath = {_powershell_string(device.shell_path)}
     $root = $shell.NameSpace($devicePath)
     $destination = {_powershell_string(str(destination))}
-    $extensions = @({extension_values})
+    $extensions = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
+    @({extension_values}) | ForEach-Object {{ [void]$extensions.Add($_) }}
     $maxImages = {max_images or 0}
     $records = New-Object System.Collections.Generic.List[object]
     $visited = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
+    $publicRoots = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
+    @('DCIM', 'Pictures', 'Movies', 'Download', 'Recordings', 'Documents',
+      'fotos xoel', 'WhatsApp', 'Telegram', 'Camera', 'Screenshots',
+      'Bluetooth', 'Android') | ForEach-Object {{ [void]$publicRoots.Add($_) }}
+    $foldersScanned = 0
+    $imagesFound = 0
 
     function Test-PublicFolder([string]$relative) {{
         $parts = @($relative -split '\\\\')
         # El primer componente suele ser Memoria interna o una tarjeta SD.
         if ($parts.Count -le 1) {{ return $true }}
         if ($parts[-1] -like '.*') {{ return $false }}
-        $publicRoots = @(
-            'DCIM', 'Pictures', 'Movies', 'Download', 'Recordings', 'Documents',
-            'fotos xoel', 'WhatsApp', 'Telegram', 'Camera', 'Screenshots',
-            'Bluetooth', 'Android'
-        )
-        if ($parts.Count -eq 2) {{ return $parts[1] -in $publicRoots }}
+        if ($parts.Count -eq 2) {{ return $publicRoots.Contains($parts[1]) }}
         # Solo Android/media se expone con fiabilidad y contiene medios de apps.
         if ($parts[1] -eq 'Android' -and $parts.Count -eq 3) {{ return $parts[2] -eq 'media' }}
         if ($relative -match '(^|\\\\)Android\\\\(data|obb)(\\\\|$)') {{ return $false }}
@@ -258,6 +528,10 @@ def copy_images_from_device(
         $folderPath = [string]$folder.Self.Path
         if ([string]::IsNullOrWhiteSpace($folderPath) -or -not $visited.Add($folderPath)) {{ return }}
         try {{ $items = @($folder.Items()) }} catch {{ return }}
+        $script:foldersScanned++
+        if (($script:foldersScanned % 5) -eq 0) {{
+            [PSCustomObject]@{{ event = 'scan'; folders = $script:foldersScanned; images = $script:imagesFound; relative = $relative }} | ConvertTo-Json -Compress
+        }}
         foreach ($item in $items) {{
             $childRelative = if ([string]::IsNullOrWhiteSpace($relative)) {{ [string]$item.Name }} else {{ "$relative\$($item.Name)" }}
             if ($item.IsFolder) {{
@@ -269,13 +543,20 @@ def copy_images_from_device(
                 continue
             }}
             $extension = [System.IO.Path]::GetExtension([string]$item.Name).ToLowerInvariant()
-            if ($extensions -contains $extension) {{
+            if ($extensions.Contains($extension)) {{
+                $remoteSize = 0
+                try {{ $remoteSize = [int64]$item.Size }} catch {{}}
                 $records.Add([PSCustomObject]@{{
                     item = $item
                     device = $devicePath
                     name = [string]$item.Name
                     relative = $relative
+                    size = $remoteSize
                 }})
+                $script:imagesFound++
+                if (($script:imagesFound % 250) -eq 0) {{
+                    [PSCustomObject]@{{ event = 'scan'; folders = $script:foldersScanned; images = $script:imagesFound; relative = $relative }} | ConvertTo-Json -Compress
+                }}
             }}
         }}
     }}
@@ -288,19 +569,21 @@ def copy_images_from_device(
     [PSCustomObject]@{{ event = 'count'; total = $records.Count }} | ConvertTo-Json -Compress
 
     $position = 0
-    $batchSize = 8
+    $batchSize = 16
+    $createdFolders = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
     for ($start = 0; $start -lt $records.Count; $start += $batchSize) {{
         $pending = New-Object System.Collections.Generic.List[object]
         $end = [Math]::Min($start + $batchSize, $records.Count)
         for ($index = $start; $index -lt $end; $index++) {{
-            $record = $records[$index]
+                $record = $records[$index]
             $position++
             try {{
                 $targetFolder = if ([string]::IsNullOrWhiteSpace([string]$record.relative)) {{ $destination }} else {{ Join-Path $destination $record.relative }}
-                [System.IO.Directory]::CreateDirectory($targetFolder) | Out-Null
+                if ($createdFolders.Add($targetFolder)) {{ [System.IO.Directory]::CreateDirectory($targetFolder) | Out-Null }}
                 $target = Join-Path $targetFolder $record.name
-                if ((Test-Path -LiteralPath $target) -and (Get-Item -LiteralPath $target).Length -gt 0) {{
-                    [PSCustomObject]@{{ event = 'file'; position = $position; total = $records.Count; local_path = $target; device = $record.device; relative = $record.relative; name = $record.name }} | ConvertTo-Json -Compress
+                $localSize = if ([System.IO.File]::Exists($target)) {{ [System.IO.FileInfo]::new($target).Length }} else {{ 0 }}
+                if ($localSize -gt 0 -and ([int64]$record.size -le 0 -or $localSize -eq [int64]$record.size)) {{
+                    [PSCustomObject]@{{ event = 'file'; position = $position; total = $records.Count; local_path = $target; device = $record.device; relative = $record.relative; name = $record.name; size = $localSize; cached = $true }} | ConvertTo-Json -Compress
                     continue
                 }}
                 if (Test-Path -LiteralPath $target) {{ Remove-Item -LiteralPath $target -Force }}
@@ -309,7 +592,7 @@ def copy_images_from_device(
                 $targetShellFolder.CopyHere($record.item, 20)
                 $pending.Add([PSCustomObject]@{{ record = $record; position = $position; target = $target }})
             }} catch {{
-                [PSCustomObject]@{{ event = 'error'; position = $position; total = $records.Count; name = $record.name; error = $_.Exception.Message }} | ConvertTo-Json -Compress
+                [PSCustomObject]@{{ event = 'error'; position = $position; total = $records.Count; local_path = $target; name = $record.name; error = $_.Exception.Message }} | ConvertTo-Json -Compress
             }}
         }}
         for ($attempt = 0; $attempt -lt 240 -and $pending.Count -gt 0; $attempt++) {{
@@ -318,58 +601,105 @@ def copy_images_from_device(
                 if (-not (Test-Path -LiteralPath $entry.target)) {{ continue }}
                 if ((Get-Item -LiteralPath $entry.target).Length -le 0) {{ continue }}
                 $pending.Remove($entry)
-                [PSCustomObject]@{{ event = 'file'; position = $entry.position; total = $records.Count; local_path = $entry.target; device = $entry.record.device; relative = $entry.record.relative; name = $entry.record.name }} | ConvertTo-Json -Compress
+                $copiedSize = (Get-Item -LiteralPath $entry.target).Length
+                [PSCustomObject]@{{ event = 'file'; position = $entry.position; total = $records.Count; local_path = $entry.target; device = $entry.record.device; relative = $entry.record.relative; name = $entry.record.name; size = $copiedSize; cached = $false }} | ConvertTo-Json -Compress
             }}
         }}
         foreach ($entry in $pending) {{
-            [PSCustomObject]@{{ event = 'error'; position = $entry.position; total = $records.Count; name = $entry.record.name; error = 'La copia no terminó en un minuto.' }} | ConvertTo-Json -Compress
+            [PSCustomObject]@{{ event = 'error'; position = $entry.position; total = $records.Count; local_path = $entry.target; name = $entry.record.name; error = 'La copia no terminó en un minuto.' }} | ConvertTo-Json -Compress
         }}
     }}
     """
-    encoded = base64.b64encode(script.encode("utf-16-le")).decode("ascii")
-    process = subprocess.Popen(
-        ["powershell", "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-EncodedCommand", encoded],
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        text=True,
-        encoding="utf-8",
-        errors="replace",
-    )
+    process, script_path = _start_powershell_script(script)
 
     mapping: dict[str, MobileImage] = {}
     copy_errors: list[str] = []
+    observed_paths: set[str] = set()
+    stderr_chunks: list[str] = []
+    assert process.stderr is not None
+    stderr_reader = threading.Thread(
+        target=lambda: stderr_chunks.append(process.stderr.read()),
+        daemon=True,
+        name="errores-mtp",
+    )
+    stderr_reader.start()
     assert process.stdout is not None
     for line in process.stdout:
         for row in _json_rows(line):
             event = row.get("event")
-            if event == "count" and on_progress:
-                on_progress(0, int(row.get("total", 0)), "Fotos localizadas; preparando caché…")
+            if event == "scan" and on_progress:
+                on_progress(
+                    MobileProgress(
+                        "scan",
+                        int(row.get("images", 0)),
+                        0,
+                        str(row.get("relative") or "Galería del móvil"),
+                    )
+                )
+            elif event == "count" and on_progress:
+                on_progress(MobileProgress("prepare", 0, int(row.get("total", 0)), "Preparando caché"))
             elif event == "file":
-                local_path = str(Path(str(row["local_path"])).resolve())
+                local_path = _absolute_path(str(row["local_path"]))
+                observed_paths.add(local_path)
+                revision = 0
+                if not row.get("cached"):
+                    try:
+                        revision = Path(local_path).stat().st_mtime_ns
+                    except OSError:
+                        revision = 1
                 mapping[local_path] = MobileImage(
                     local_path,
                     str(row["device"]),
                     str(row.get("relative") or ""),
                     str(row["name"]),
+                    int(row.get("size") or 0),
+                    revision,
                 )
                 if on_progress:
-                    on_progress(int(row["position"]), int(row["total"]), str(row["name"]))
+                    on_progress(
+                        MobileProgress(
+                            "reuse" if row.get("cached") else "copy",
+                            int(row["position"]),
+                            int(row["total"]),
+                            str(row["name"]),
+                        )
+                    )
             elif event == "error":
+                if row.get("local_path"):
+                    observed_paths.add(_absolute_path(str(row["local_path"])))
                 copy_errors.append(f"{row.get('name', 'Archivo')}: {row.get('error', 'No se pudo copiar')}")
 
-    stderr = process.stderr.read() if process.stderr else ""
     exit_code = process.wait()
+    stderr_reader.join(timeout=2)
+    script_path.unlink(missing_ok=True)
+    stderr = "".join(stderr_chunks)
     if exit_code and not mapping:
         raise RuntimeError(stderr.strip() or "No se pudieron preparar las fotos del móvil.")
     if not mapping:
         detail = copy_errors[0] if copy_errors else "No se encontraron imágenes compatibles en el móvil."
         raise RuntimeError(f"No se pudieron preparar fotos del móvil: {detail}")
-    _remove_stale_cache_images(destination, set(mapping))
+    if max_images is None:
+        _remove_stale_cache_images(
+            destination,
+            observed_paths,
+            set(previous_mapping) if previous_mapping else None,
+        )
+        if not copy_errors:
+            _save_manifest(destination, device, mapping)
     return destination, mapping
 
 
-def delete_mobile_images(images: list[MobileImage]) -> tuple[set[MobileImage], list[str]]:
-    """Borra originales MTP y solo confirma éxito cuando desaparecen del móvil."""
+def delete_mobile_images(
+    images: list[MobileImage],
+    on_progress: Callable[[int, int, str], None] | None = None,
+) -> tuple[set[MobileImage], list[str]]:
+    """Borra un lote MTP sin diálogos del Shell y verifica cada resultado.
+
+    La vía principal usa una sola instancia de IFileOperation con
+    FOF_NOCONFIRMATION. Solo si el proveedor MTP rechaza esa API se recurre al
+    verbo clásico de Explorer, aceptando exclusivamente avisos de los nombres
+    que la persona ya confirmó en la interfaz.
+    """
     if not images:
         return set(), []
     rows = [
@@ -380,8 +710,10 @@ def delete_mobile_images(images: list[MobileImage]) -> tuple[set[MobileImage], l
     script = f"""
     $ErrorActionPreference = 'Continue'
     [Console]::OutputEncoding = [System.Text.UTF8Encoding]::new($false)
-    $records = [Text.Encoding]::UTF8.GetString([Convert]::FromBase64String({_powershell_string(encoded_rows)})) | ConvertFrom-Json
+    $records = @([Text.Encoding]::UTF8.GetString([Convert]::FromBase64String({_powershell_string(encoded_rows)})) | ConvertFrom-Json)
     $shell = New-Object -ComObject Shell.Application
+    $folders = @{{}}
+    $candidates = New-Object System.Collections.Generic.List[object]
     $pending = New-Object System.Collections.Generic.List[object]
 
     function Open-MobileFolder([object]$record) {{
@@ -400,26 +732,86 @@ def delete_mobile_images(images: list[MobileImage]) -> tuple[set[MobileImage], l
         return $folder
     }}
 
-    # MTP muestra este cuadro por cada InvokeVerb incluso cuando ya existe una
-    # confirmación propia en la aplicación. El asistente solo pulsa "Sí" en
-    # diálogos cuyo texto contiene el nombre de una imagen que el usuario ya
-    # seleccionó; no toca otros diálogos de Windows.
-    $dialogCloser = @'
-{DIALOG_CLOSER_CSHARP}
-'@
-    if (-not ('MobileDeleteDialogCloser' -as [type])) {{
-        Add-Type -TypeDefinition $dialogCloser -ErrorAction Stop
+    function Get-FolderKey([object]$record) {{
+        return ([string]$record.device + [char]0 + [string]$record.relative)
     }}
-    [MobileDeleteDialogCloser]::Start([string[]]@($records | ForEach-Object {{ [string]$_.name }}), 90000)
+
+    function Get-CachedFolder([object]$record, [bool]$refresh) {{
+        $key = Get-FolderKey $record
+        if ($refresh -or -not $folders.ContainsKey($key)) {{
+            $folders[$key] = Open-MobileFolder $record
+        }}
+        return $folders[$key]
+    }}
+
+    function Write-Result([object]$record, [bool]$deleted, [string]$errorMessage) {{
+        [PSCustomObject]@{{
+            device = $record.device
+            relative = $record.relative
+            name = $record.name
+            deleted = $deleted
+            error = $errorMessage
+        }} | ConvertTo-Json -Compress
+    }}
+
+    function Confirm-Deleted([System.Collections.Generic.List[object]]$items, [int]$timeoutMilliseconds) {{
+        $until = [DateTime]::UtcNow.AddMilliseconds($timeoutMilliseconds)
+        while ($items.Count -gt 0 -and [DateTime]::UtcNow -lt $until) {{
+            Start-Sleep -Milliseconds 200
+            foreach ($group in @($items.ToArray() | Group-Object key)) {{
+                try {{
+                    $sample = $group.Group[0].record
+                    $folder = Get-CachedFolder $sample $true
+                    foreach ($entry in @($group.Group)) {{
+                        if ($null -ne $folder.ParseName([string]$entry.record.name)) {{ continue }}
+                        [void]$items.Remove($entry)
+                        Write-Result $entry.record $true ''
+                    }}
+                }} catch {{}}
+            }}
+        }}
+    }}
+
+    $shellOperations = @'
+{SHELL_OPERATIONS_CSHARP}
+'@
+    if (-not ('MobileShellBatch' -as [type])) {{
+        Add-Type -TypeDefinition $shellOperations -ErrorAction Stop
+    }}
 
     foreach ($record in $records) {{
+        try {{
+            $folder = Get-CachedFolder $record $false
+            $item = $folder.ParseName([string]$record.name)
+            if ($null -eq $item) {{ throw 'No se encontró el archivo en el móvil.' }}
+            $entry = [PSCustomObject]@{{ record = $record; item = $item; key = (Get-FolderKey $record) }}
+            $candidates.Add($entry)
+            $pending.Add($entry)
+        }} catch {{
+            Write-Result $record $false $_.Exception.Message
+        }}
+    }}
+
+    # IFileOperation recibe todos los IShellItem antes de ejecutar: Windows ve
+    # una única operación y FOF_NOCONFIRMATION equivale a "Sí a todo".
+    if ($candidates.Count -gt 0) {{
+        $batchError = ''
+        [void][MobileShellBatch]::Delete([object[]]@($candidates | ForEach-Object {{ $_.item }}), [ref]$batchError)
+        Confirm-Deleted $pending 10000
+    }}
+
+    # Fallback para extensiones MTP defectuosas. Solo alcanza elementos que la
+    # operación nativa no eliminó y el cerrador se restringe a sus nombres.
+    if ($pending.Count -gt 0) {{
+        [MobileDeleteDialogCloser]::Start(
+            [string[]]@($pending | ForEach-Object {{ [string]$_.record.name }}),
+            [Math]::Max(15000, $pending.Count * 1500)
+        )
+        foreach ($entry in $pending.ToArray()) {{
             try {{
-                $folder = Open-MobileFolder $record
-                $item = $folder.ParseName([string]$record.name)
-                if ($null -eq $item) {{ throw 'No se encontró el archivo en el móvil.' }}
-                # "delete" es el verbo canónico del Shell. Si un proveedor MTP no
-                # lo publica así, se busca el verbo visible (también en Windows en
-                # español) antes de dar el archivo por no eliminable.
+                $folder = Get-CachedFolder $entry.record $true
+                $item = $folder.ParseName([string]$entry.record.name)
+                if ($null -eq $item) {{ continue }}
                 try {{
                     $item.InvokeVerb('delete')
                 }} catch {{
@@ -429,49 +821,51 @@ def delete_mobile_images(images: list[MobileImage]) -> tuple[set[MobileImage], l
                     if ($deleteVerb.Count -eq 0) {{ throw }}
                     $item.InvokeVerb([string]$deleteVerb[0].Name)
                 }}
-                $pending.Add($record)
             }} catch {{
-                [PSCustomObject]@{{ device = $record.device; relative = $record.relative; name = $record.name; deleted = $false; error = $_.Exception.Message }} | ConvertTo-Json -Compress
-            }}
-    }}
-
-    # InvokeVerb inicia una operación asíncrona para MTP. No se borra la copia
-    # local ni se actualiza la interfaz hasta que una consulta nueva al Shell
-    # confirme que el elemento ya no está en el dispositivo.
-    for ($attempt = 0; $attempt -lt 120 -and $pending.Count -gt 0; $attempt++) {{
-        Start-Sleep -Milliseconds 250
-        foreach ($record in $pending.ToArray()) {{
-            try {{
-                $checkFolder = Open-MobileFolder $record
-                $remaining = $checkFolder.ParseName([string]$record.name)
-                if ($null -ne $remaining) {{ continue }}
-                $pending.Remove($record)
-                [PSCustomObject]@{{ device = $record.device; relative = $record.relative; name = $record.name; deleted = $true }} | ConvertTo-Json -Compress
-            }} catch {{
-                # Un error temporal de MTP no equivale a que se haya borrado.
+                # La comprobación final determinará si el proveedor aceptó la operación.
             }}
         }}
+        Confirm-Deleted $pending 30000
     }}
-    foreach ($record in $pending) {{
-        [PSCustomObject]@{{ device = $record.device; relative = $record.relative; name = $record.name; deleted = $false; error = 'Windows no confirmó el borrado en el móvil.' }} | ConvertTo-Json -Compress
+    foreach ($entry in $pending) {{
+        Write-Result $entry.record $false 'Windows no confirmó el borrado en el móvil.'
     }}
     """
-    result = _run_powershell(script)
+    process, script_path = _start_powershell_script(script)
     by_remote = {
         (image.device_shell_path, image.relative_parent, image.name): image
         for image in images
     }
-    deleted = {
-        by_remote[(str(row.get("device")), str(row.get("relative") or ""), str(row.get("name")))]
-        for row in _json_rows(result.stdout)
-        if row.get("deleted")
-        and (str(row.get("device")), str(row.get("relative") or ""), str(row.get("name"))) in by_remote
-    }
-    failures = [
-        f"{row.get('name', 'Archivo')}: {row.get('error', 'No se pudo borrar')}"
-        for row in _json_rows(result.stdout)
-        if not row.get("deleted")
-    ]
-    if result.returncode and not failures:
-        failures.append(result.stderr.strip() or "Windows no pudo borrar los archivos del móvil.")
+    deleted: set[MobileImage] = set()
+    failures: list[str] = []
+    stderr_chunks: list[str] = []
+    assert process.stderr is not None
+    stderr_reader = threading.Thread(
+        target=lambda: stderr_chunks.append(process.stderr.read()),
+        daemon=True,
+        name="errores-borrado-mtp",
+    )
+    stderr_reader.start()
+    assert process.stdout is not None
+    processed = 0
+    for line in process.stdout:
+        for row in _json_rows(line):
+            key = (str(row.get("device")), str(row.get("relative") or ""), str(row.get("name")))
+            image = by_remote.get(key)
+            if image is None:
+                continue
+            processed += 1
+            if row.get("deleted"):
+                deleted.add(image)
+            else:
+                failures.append(f"{row.get('name', 'Archivo')}: {row.get('error', 'No se pudo borrar')}")
+            if on_progress:
+                on_progress(processed, len(images), image.name)
+    exit_code = process.wait()
+    stderr_reader.join(timeout=2)
+    script_path.unlink(missing_ok=True)
+    if exit_code and not failures:
+        failures.append("".join(stderr_chunks).strip() or "Windows no pudo borrar los archivos del móvil.")
+    if deleted:
+        _remove_manifest_images(deleted)
     return deleted, failures
