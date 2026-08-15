@@ -34,7 +34,8 @@ class MobileDevice:
 @dataclass(frozen=True)
 class MobileImage:
     local_path: str
-    parent_shell_path: str
+    device_shell_path: str
+    relative_parent: str
     name: str
 
 
@@ -142,7 +143,8 @@ def copy_images_from_device(
     $ErrorActionPreference = 'Stop'
     [Console]::OutputEncoding = [System.Text.UTF8Encoding]::new($false)
     $shell = New-Object -ComObject Shell.Application
-    $root = $shell.NameSpace({_powershell_string(device.shell_path)})
+    $devicePath = {_powershell_string(device.shell_path)}
+    $root = $shell.NameSpace($devicePath)
     $destination = {_powershell_string(str(destination))}
     $extensions = @({extension_values})
     $maxImages = {max_images or 0}
@@ -184,7 +186,7 @@ def copy_images_from_device(
             if ($extensions -contains $extension) {{
                 $records.Add([PSCustomObject]@{{
                     item = $item
-                    parent = [string]$folder.Self.Path
+                    device = $devicePath
                     name = [string]$item.Name
                     relative = $relative
                 }})
@@ -212,7 +214,7 @@ def copy_images_from_device(
                 [System.IO.Directory]::CreateDirectory($targetFolder) | Out-Null
                 $target = Join-Path $targetFolder $record.name
                 if ((Test-Path -LiteralPath $target) -and (Get-Item -LiteralPath $target).Length -gt 0) {{
-                    [PSCustomObject]@{{ event = 'file'; position = $position; total = $records.Count; local_path = $target; parent = $record.parent; name = $record.name }} | ConvertTo-Json -Compress
+                    [PSCustomObject]@{{ event = 'file'; position = $position; total = $records.Count; local_path = $target; device = $record.device; relative = $record.relative; name = $record.name }} | ConvertTo-Json -Compress
                     continue
                 }}
                 if (Test-Path -LiteralPath $target) {{ Remove-Item -LiteralPath $target -Force }}
@@ -230,7 +232,7 @@ def copy_images_from_device(
                 if (-not (Test-Path -LiteralPath $entry.target)) {{ continue }}
                 if ((Get-Item -LiteralPath $entry.target).Length -le 0) {{ continue }}
                 $pending.Remove($entry)
-                [PSCustomObject]@{{ event = 'file'; position = $entry.position; total = $records.Count; local_path = $entry.target; parent = $entry.record.parent; name = $entry.record.name }} | ConvertTo-Json -Compress
+                [PSCustomObject]@{{ event = 'file'; position = $entry.position; total = $records.Count; local_path = $entry.target; device = $entry.record.device; relative = $entry.record.relative; name = $entry.record.name }} | ConvertTo-Json -Compress
             }}
         }}
         foreach ($entry in $pending) {{
@@ -258,7 +260,12 @@ def copy_images_from_device(
                 on_progress(0, int(row.get("total", 0)), "Fotos localizadas; preparando caché…")
             elif event == "file":
                 local_path = str(Path(str(row["local_path"])).resolve())
-                mapping[local_path] = MobileImage(local_path, str(row["parent"]), str(row["name"]))
+                mapping[local_path] = MobileImage(
+                    local_path,
+                    str(row["device"]),
+                    str(row.get("relative") or ""),
+                    str(row["name"]),
+                )
                 if on_progress:
                     on_progress(int(row["position"]), int(row["total"]), str(row["name"]))
             elif event == "error":
@@ -279,7 +286,10 @@ def delete_mobile_images(images: list[MobileImage]) -> tuple[set[MobileImage], l
     """Borra originales MTP y solo confirma éxito cuando desaparecen del móvil."""
     if not images:
         return set(), []
-    rows = [{"parent": image.parent_shell_path, "name": image.name} for image in images]
+    rows = [
+        {"device": image.device_shell_path, "relative": image.relative_parent, "name": image.name}
+        for image in images
+    ]
     encoded_rows = base64.b64encode(json.dumps(rows).encode("utf-8")).decode("ascii")
     script = f"""
     $ErrorActionPreference = 'Continue'
@@ -287,10 +297,26 @@ def delete_mobile_images(images: list[MobileImage]) -> tuple[set[MobileImage], l
     $records = [Text.Encoding]::UTF8.GetString([Convert]::FromBase64String({_powershell_string(encoded_rows)})) | ConvertFrom-Json
     $shell = New-Object -ComObject Shell.Application
     $pending = New-Object System.Collections.Generic.List[object]
+
+    function Open-MobileFolder([object]$record) {{
+        # La ruta Self.Path de una carpeta MTP solo es válida para la sesión que
+        # la enumeró. Se vuelve a abrir desde la raíz del dispositivo usando la
+        # ruta relativa estable guardada durante la importación.
+        $folder = $shell.NameSpace([string]$record.device)
+        if ($null -eq $folder) {{ throw 'No se pudo abrir el dispositivo conectado.' }}
+        foreach ($segment in ([string]$record.relative -split '\\\\')) {{
+            if ([string]::IsNullOrWhiteSpace($segment)) {{ continue }}
+            $folderItem = $folder.ParseName($segment)
+            if ($null -eq $folderItem) {{ throw "No se pudo abrir la carpeta '$segment' en el móvil." }}
+            $folder = $folderItem.GetFolder
+            if ($null -eq $folder) {{ throw "No se pudo abrir la carpeta '$segment' en el móvil." }}
+        }}
+        return $folder
+    }}
+
     foreach ($record in $records) {{
         try {{
-            $folder = $shell.NameSpace([string]$record.parent)
-            if ($null -eq $folder) {{ throw 'No se pudo abrir la carpeta original.' }}
+            $folder = Open-MobileFolder $record
             $item = $folder.ParseName([string]$record.name)
             if ($null -eq $item) {{ throw 'No se encontró el archivo en el móvil.' }}
             # "delete" es el verbo canónico del Shell. Si un proveedor MTP no
@@ -307,7 +333,7 @@ def delete_mobile_images(images: list[MobileImage]) -> tuple[set[MobileImage], l
             }}
             $pending.Add($record)
         }} catch {{
-            [PSCustomObject]@{{ parent = $record.parent; name = $record.name; deleted = $false; error = $_.Exception.Message }} | ConvertTo-Json -Compress
+            [PSCustomObject]@{{ device = $record.device; relative = $record.relative; name = $record.name; deleted = $false; error = $_.Exception.Message }} | ConvertTo-Json -Compress
         }}
     }}
 
@@ -318,26 +344,30 @@ def delete_mobile_images(images: list[MobileImage]) -> tuple[set[MobileImage], l
         Start-Sleep -Milliseconds 250
         foreach ($record in $pending.ToArray()) {{
             try {{
-                $checkFolder = $shell.NameSpace([string]$record.parent)
-                $remaining = if ($null -eq $checkFolder) {{ $null }} else {{ $checkFolder.ParseName([string]$record.name) }}
+                $checkFolder = Open-MobileFolder $record
+                $remaining = $checkFolder.ParseName([string]$record.name)
                 if ($null -ne $remaining) {{ continue }}
                 $pending.Remove($record)
-                [PSCustomObject]@{{ parent = $record.parent; name = $record.name; deleted = $true }} | ConvertTo-Json -Compress
+                [PSCustomObject]@{{ device = $record.device; relative = $record.relative; name = $record.name; deleted = $true }} | ConvertTo-Json -Compress
             }} catch {{
                 # Un error temporal de MTP no equivale a que se haya borrado.
             }}
         }}
     }}
     foreach ($record in $pending) {{
-        [PSCustomObject]@{{ parent = $record.parent; name = $record.name; deleted = $false; error = 'Windows no confirmó el borrado en el móvil.' }} | ConvertTo-Json -Compress
+        [PSCustomObject]@{{ device = $record.device; relative = $record.relative; name = $record.name; deleted = $false; error = 'Windows no confirmó el borrado en el móvil.' }} | ConvertTo-Json -Compress
     }}
     """
     result = _run_powershell(script)
-    by_remote = {(image.parent_shell_path, image.name): image for image in images}
+    by_remote = {
+        (image.device_shell_path, image.relative_parent, image.name): image
+        for image in images
+    }
     deleted = {
-        by_remote[(str(row.get("parent")), str(row.get("name")))]
+        by_remote[(str(row.get("device")), str(row.get("relative") or ""), str(row.get("name")))]
         for row in _json_rows(result.stdout)
-        if row.get("deleted") and (str(row.get("parent")), str(row.get("name"))) in by_remote
+        if row.get("deleted")
+        and (str(row.get("device")), str(row.get("relative") or ""), str(row.get("name"))) in by_remote
     }
     failures = [
         f"{row.get('name', 'Archivo')}: {row.get('error', 'No se pudo borrar')}"
