@@ -61,6 +61,10 @@ que Windows confirma que cada original ya no existe en el móvil. El teléfono
 tiene que permanecer encendido, desbloqueado y conectado durante la importación
 y durante un borrado.
 
+Al borrar varias imágenes, V3 solicita una única confirmación para la selección
+completa. Las confirmaciones repetidas de Explorer se suprimen solo durante esa
+operación y el ajuste previo de Windows se restaura al terminar.
+
 ### Línea de comandos
 
 ```powershell

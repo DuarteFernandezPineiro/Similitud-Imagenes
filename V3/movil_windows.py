@@ -297,6 +297,11 @@ def delete_mobile_images(images: list[MobileImage]) -> tuple[set[MobileImage], l
     $records = [Text.Encoding]::UTF8.GetString([Convert]::FromBase64String({_powershell_string(encoded_rows)})) | ConvertFrom-Json
     $shell = New-Object -ComObject Shell.Application
     $pending = New-Object System.Collections.Generic.List[object]
+    $confirmationKey = 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Policies\Explorer'
+    $confirmationName = 'ConfirmFileDelete'
+    $keyExisted = Test-Path -LiteralPath $confirmationKey
+    $hadConfirmationValue = $false
+    $previousConfirmationValue = $null
 
     function Open-MobileFolder([object]$record) {{
         # La ruta Self.Path de una carpeta MTP solo es válida para la sesión que
@@ -314,27 +319,54 @@ def delete_mobile_images(images: list[MobileImage]) -> tuple[set[MobileImage], l
         return $folder
     }}
 
-    foreach ($record in $records) {{
+    # La aplicación ya muestra una única confirmación para toda la selección.
+    # Este ajuste de Explorer se desactiva de forma temporal para que InvokeVerb
+    # no abra un cuadro adicional por cada archivo MTP y se restaura enseguida.
+    try {{
         try {{
-            $folder = Open-MobileFolder $record
-            $item = $folder.ParseName([string]$record.name)
-            if ($null -eq $item) {{ throw 'No se encontró el archivo en el móvil.' }}
-            # "delete" es el verbo canónico del Shell. Si un proveedor MTP no
-            # lo publica así, se busca el verbo visible (también en Windows en
-            # español) antes de dar el archivo por no eliminable.
-            try {{
-                $item.InvokeVerb('delete')
-            }} catch {{
-                $deleteVerb = @($item.Verbs() | Where-Object {{
-                    ([string]$_.Name -replace '&', '') -match '(?i)^(delete|eliminar)'
-                }} | Select-Object -First 1)
-                if ($deleteVerb.Count -eq 0) {{ throw }}
-                $item.InvokeVerb([string]$deleteVerb[0].Name)
+            $existing = Get-ItemProperty -LiteralPath $confirmationKey -Name $confirmationName -ErrorAction SilentlyContinue
+            if ($null -ne $existing) {{
+                $hadConfirmationValue = $true
+                $previousConfirmationValue = $existing.$confirmationName
             }}
-            $pending.Add($record)
+            if (-not $keyExisted) {{ New-Item -Path $confirmationKey -Force | Out-Null }}
+            New-ItemProperty -LiteralPath $confirmationKey -Name $confirmationName -PropertyType DWord -Value 0 -Force | Out-Null
         }} catch {{
-            [PSCustomObject]@{{ device = $record.device; relative = $record.relative; name = $record.name; deleted = $false; error = $_.Exception.Message }} | ConvertTo-Json -Compress
+            # Si una política corporativa impide cambiarlo, se conserva el
+            # comportamiento de Windows en lugar de bloquear el borrado.
         }}
+
+        foreach ($record in $records) {{
+            try {{
+                $folder = Open-MobileFolder $record
+                $item = $folder.ParseName([string]$record.name)
+                if ($null -eq $item) {{ throw 'No se encontró el archivo en el móvil.' }}
+                # "delete" es el verbo canónico del Shell. Si un proveedor MTP no
+                # lo publica así, se busca el verbo visible (también en Windows en
+                # español) antes de dar el archivo por no eliminable.
+                try {{
+                    $item.InvokeVerb('delete')
+                }} catch {{
+                    $deleteVerb = @($item.Verbs() | Where-Object {{
+                        ([string]$_.Name -replace '&', '') -match '(?i)^(delete|eliminar)'
+                    }} | Select-Object -First 1)
+                    if ($deleteVerb.Count -eq 0) {{ throw }}
+                    $item.InvokeVerb([string]$deleteVerb[0].Name)
+                }}
+                $pending.Add($record)
+            }} catch {{
+                [PSCustomObject]@{{ device = $record.device; relative = $record.relative; name = $record.name; deleted = $false; error = $_.Exception.Message }} | ConvertTo-Json -Compress
+            }}
+        }}
+    }} finally {{
+        try {{
+            if ($hadConfirmationValue) {{
+                New-ItemProperty -LiteralPath $confirmationKey -Name $confirmationName -PropertyType DWord -Value $previousConfirmationValue -Force | Out-Null
+            }} else {{
+                Remove-ItemProperty -LiteralPath $confirmationKey -Name $confirmationName -ErrorAction SilentlyContinue
+                if (-not $keyExisted) {{ Remove-Item -LiteralPath $confirmationKey -Force -ErrorAction SilentlyContinue }}
+            }}
+        }} catch {{}}
     }}
 
     # InvokeVerb inicia una operación asíncrona para MTP. No se borra la copia
